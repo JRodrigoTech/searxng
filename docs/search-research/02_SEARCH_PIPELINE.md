@@ -1,135 +1,215 @@
 # Search pipeline
 
+## Compatibility objective
+
+The pipeline must preserve both provider behavior and the order in which common aggregation steps happen. Changing phase order can change positions, duplicate identity, scores, and final ordering even when provider parsers return the same links.
+
 ## End-to-end sequence
 
-The following sequence is the implementation target for an ordinary web search:
+For an ordinary search:
 
-1. Validate the query and output limit.
-2. Capture start = monotonic() and compute deadline = start + total_timeout.
-3. Resolve the requested provider set.
-4. Parse language and region input once.
-5. Ask each provider for a capability-aware request.
-6. Drop providers that cannot support the requested page or time filter, recording an unsupported-capability outcome.
-7. Start all remaining provider operations concurrently.
-8. Give each operation the remaining time at the instant its network operation begins.
-9. Decode and parse each completed response in its provider task.
-10. Assign provider positions to valid main results in provider order.
-11. Normalize URLs, text, thumbnails, dates, and metadata.
-12. Insert normalized results into the merge index using canonical identity.
-13. Aggregate provider provenance and positions.
-14. Calculate scores.
-15. Apply deterministic ordering and the final limit.
-16. Return successful results plus compact provider diagnostics.
+1. record one monotonic search start;
+2. resolve selected primary providers;
+3. skip missing/uninitialized/suspended providers;
+4. apply common capability checks for page and time range;
+5. prepare common request params including locale, safe-search, page, time range, and generic `Accept-Language`;
+6. derive one shared `actual_timeout`;
+7. start every eligible provider concurrently;
+8. each provider mutates its prepared request with endpoint-specific URL, headers, cookies, form/query fields, and transport profile;
+9. each provider performs HTTP work using the remaining common search budget;
+10. common HTTP errors are classified before provider parsing;
+11. provider parser emits main results and optional side channels;
+12. late providers are prevented from inserting results after timeout;
+13. accepted results are normalized as they enter the shared aggregate;
+14. accepted main-result position is assigned per provider using accepted-result ordinal;
+15. normalized identity is looked up in the global merge map;
+16. duplicate fields/provenance/positions are merged immediately;
+17. when collection is complete, scores are calculated;
+18. results are stable-sorted by score descending;
+19. category/template/image grouping performs the second ordering pass;
+20. only then apply the caller's final result limit;
+21. apply explicit host output/security policy;
+22. serialize the bounded result to the agent.
 
-## Observed execution behavior
+## Search request fields
 
-### Search clock
-
-**Observation:** The search clock starts at entry to the search operation, before provider requests are dispatched. Provider requests use one shared start time and a timeout derived from the default provider timeout, an optional query timeout, and an optional maximum request timeout.
-
-**Observation:** Each worker is joined with the remaining time, not with a fresh full timeout. A worker that is still running after the deadline is marked as timed out. The underlying thread may finish later, but its result is no longer accepted.
-
-**Recommendation:** Preserve the shared-deadline semantic, but use cancellable asynchronous tasks in the new implementation. Never reset the clock for parsing, retries, or a later provider.
-
-### Provider selection
-
-**Observation:** A provider is skipped when it is absent, suspended, uninitialized, or cannot build a request for the requested page/time combination. The active configuration snapshot also disables Google and Bing while leaving the DuckDuckGo HTML adapter enabled; this is configuration, not a protocol limitation.
-
-**Recommendation:** Make provider selection explicit in the SearchRequest. The default may include all three, but a deployment can disable a provider without changing the adapter.
-
-### Request preparation
-
-Each adapter receives the same conceptual input:
+The common provider input conceptually carries:
 
     query
-    page            # one-based
-    language
-    region
-    safe_search
-    time_range
-    remaining_time
+    page                # one-based
+    safe_search         # 0, 1, 2
+    time_range          # none/day/week/month/year
+    locale
+    provider category
+    provider-specific state handle
 
-The adapter returns one of:
+Providers do not receive arbitrary raw parameter dictionaries from the model.
 
-- ProviderRequest — ready for transport.
-- UnsupportedCapability — the provider cannot honor the requested option.
-- ProviderFailure — request preparation itself failed.
+## Eligibility behavior
 
-Unsupported options should be reported distinctly from network errors. For example, Bing’s active adapter has no page/time capability in the analyzed path, while Google and DuckDuckGo do.
+The common capability gate rejects/skips a provider when:
 
-### Network and parse execution
+- requested page > 1 and provider does not advertise paging;
+- requested page exceeds provider maximum page;
+- a time range is requested and provider does not advertise time-range support.
 
-The provider operation should combine:
+For the primary three:
 
-1. request construction;
-2. transport call;
-3. HTTP/status/block inspection;
-4. response decoding;
-5. provider-specific extraction;
-6. provider-result validation.
+| Provider | Paging | Max | Time range |
+| --- | --- | ---: | --- |
+| Google | yes | 50 | yes |
+| Bing | no | — | no |
+| DuckDuckGo HTML | yes | common configured max unless otherwise bounded | yes |
 
-This keeps a provider’s anti-bot signatures and redirect rules out of generic transport code.
+Thus a page-2 or time-filtered aggregate can legitimately omit Bing rather than sending invented parameters.
 
-### Result insertion
+## Common request defaults
 
-Provider positions are assigned to valid main results in the order in which the provider parser emits them. A result that is later merged still retains the position it had in each provider’s list.
+Before provider mutation, online requests use:
 
-If the provider emits an item with no title, no absolute destination, or an unusable redirect, the item is skipped and parsing continues where safe. A malformed whole document becomes a provider parse failure.
+    method=GET
+    headers={}
+    data={}
+    json={}
+    content=b""
+    url=""
+    cookies={}
+    allow_redirects=false
+    max_redirects=0
+    soft_max_redirects=0
+    auth=None
+    verify=None
+    raise_for_httperror=true
 
-## First-page fast path
+The generic layer adds `Accept-Language` when enabled.
 
-The recommended V1 path is one request per provider:
+Provider request builders then mutate this request. A builder can intentionally leave `url` empty/none, in which case no network call is made.
 
-| Provider | V1 first-page request | Expected document |
-| --- | --- | --- |
-| Google | One GET | XML-like HTML mobile result page |
-| Bing | One GET | Standard HTML result page |
-| DuckDuckGo | One POST | No-JavaScript HTML result page |
+## Provider request/parse summaries
 
-The first-page path avoids DuckDuckGo token acquisition for the initial request. A later page needs provider state and should be enabled only after the first page has succeeded.
+### Google
 
-## Provider-specific state in the pipeline
+    prepare locale/safe/time/page
+      -> GET WML endpoint
+      -> Nokia UA + chrome99_android
+      -> generic HTTP layer
+      -> Google sorry/302 checks
+      -> strip optional XML declaration
+      -> XPath result parsing
+      -> /url?q= unwrap
+      -> typed main results
 
-- Google has process-start locale traits and a rotating/fixed set of mobile User-Agent values.
-- Bing has process-start region traits; its active search request uses the selected market in setlang and optionally cc.
-- DuckDuckGo has process-start traits, a stable process-level User-Agent, cookies for region/time, and a validation token cached by query plus User-Agent.
+Individual malformed result blocks are isolated and skipped.
 
-State lookup must be bounded and must not block the entire search on a slow trait refresh. A stale or missing trait map should fall back to a documented default.
+### Bing
 
-## Partial failure semantics
+    prepare q/adlt/setlang/cc
+      -> GET /search
+      -> default browser transport, conditional HTTP3
+      -> generic HTTP layer
+      -> b_algo parsing
+      -> optional ck/a base64url decode
+      -> legacy main-result dictionaries
 
-Example:
+Malformed recognized base64 can escape the parser and become provider-level failure.
 
-    Google       succeeds in 300 ms
-    Bing         fails in 700 ms
-    DuckDuckGo   is unfinished at the deadline
+### Primary DuckDuckGo
 
-The SearchResponse contains Google results, Bing’s typed failure, and DuckDuckGo’s timeout outcome. The search operation itself is successful if at least one provider produced usable results; the response may still carry an overall degraded status.
+    preprocess query / stable UA
+      -> POST HTML endpoint
+      -> region/time form+cookies
+      -> first-page or vqd continuation fields
+      -> generic HTTP layer
+      -> 303 empty OR challenge-form check
+      -> cache hidden vqd
+      -> web-result extraction
+      -> typed main results
+      -> optional zero-click answer
 
-If every provider fails, return an empty bounded result list plus typed diagnostics. Do not invent a successful result or expose a raw exception as the only explanation.
+## Provider-local position semantics
 
-## Provider diagnostics
+Positions are assigned by the common result container, not from DOM indexes.
 
-The coordinator should record, per provider:
+For each provider call:
 
-    provider
-    prepared
-    started_at
-    elapsed_ms
-    status
-    raw_result_count
-    normalized_result_count
-    merged_result_count
-    failure_type
-    timeout
-    blocked
-    parse_error
+    main_count = 0
 
-The returned tool response may expose a safe summary such as providers_succeeded and providers_degraded. Detailed transport state belongs in structured logs or metrics.
+For each accepted normal main result:
 
-## Explicitly excluded paths
+    main_count += 1
+    position = main_count
 
-- External bang/redirect commands are not part of the ordinary search contract.
-- Answer, infobox, suggestion, and correction objects are optional side channels, not required V1 main results.
-- A provider’s JavaScript API endpoint is not used merely because it can return JSON.
-- Search result URLs are not fetched after search.
+Side channels do not increment the main position. Provider parser items skipped before insertion do not increment it either.
+
+This position then immediately participates in duplicate merge.
+
+## Normalization before merge
+
+Every main result is normalized before hashing:
+
+- provider provenance initialization;
+- whitespace collapse;
+- title/content limits;
+- content==title clearing;
+- URL parsing/default-scheme/IDNA behavior.
+
+Do not calculate identity from raw parser output and normalize afterward; that changes duplicates.
+
+## Global merge while providers finish
+
+There is one shared identity map. Results are inserted as provider workers finish and are extended into the container.
+
+No separate stage waits for all provider lists and then pre-deduplicates each provider. Same-provider and cross-provider duplicates use the same merge function.
+
+This insertion order also supplies stable-sort tie order later, so an async reimplementation that buffers all providers and then processes them in a fixed provider-name order would alter exact tie behavior.
+
+## Shared deadline
+
+All eligible provider workers start before waits. Every wait/network operation consumes time relative to one search start.
+
+A worker that exceeds the caller's shared deadline is marked timed out. If it later finishes, common insertion logic sees the timeout marker and does not add its result set.
+
+A native async implementation should reproduce accepted-result timing semantics even if it can cancel work more effectively.
+
+## Error path
+
+Expected provider/transport exceptions are captured inside the provider worker. The provider is recorded as unresponsive/failed according to common handling. Siblings continue.
+
+A search can therefore return:
+
+    results != []
+    plus one or more provider failures
+
+A provider returning a healthy empty list is distinct from a provider exception.
+
+## Aggregation close/order
+
+After accepted providers finish or time out:
+
+1. calculate score for every merged main result;
+2. stable sort descending score;
+3. run the grouping pass using category, template, image marker, group count 8, distance 20;
+4. project/limit results.
+
+Skipping step 3 is not parity.
+
+## Final host boundary
+
+Provider-compatible aggregation can be followed by Overmind-specific output checks, such as restricting schemes before exposing URLs to another capability. Such policies must not feed back into compatibility ranking unless intentionally designed and separately tested.
+
+## Pipeline golden test
+
+A single integration fixture should execute fake Google/Bing/DDG results through the full sequence and assert:
+
+- provider accepted positions;
+- normalization;
+- identities;
+- same-provider/cross-provider merges;
+- exact scores;
+- stable equal-score insertion behavior;
+- final grouping order;
+- final output limit;
+- sibling survival on one provider failure;
+- late result rejection.
+
+That integration fixture is the strongest guard against future “cleanup” refactors accidentally changing search behavior.
