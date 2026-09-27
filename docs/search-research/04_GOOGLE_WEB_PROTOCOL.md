@@ -1,83 +1,99 @@
 # Google Web Search protocol
 
-## Scope
+## Status and compatibility target
 
-This specification covers the public, non-API representation used for ordinary web results. It intentionally does not depend on a JavaScript-rendered search page or a commercial search API.
+This document is the implementation specification for the audited Google web-search path. Statements marked **PARITY MUST** describe behavior that must be reproduced by the new search tool unless a later change is explicitly documented as a deliberate deviation.
 
-**Observation:** The normal desktop representation is JavaScript-heavy. The selected mobile/legacy representation is preferred because it returns a parseable result document without running JavaScript and is therefore suitable for a bounded server-side request.
+The target is behavioral compatibility, not a redesign. Do not silently add URL validation, different safe-search semantics, different browser fingerprints, different redirect handling, or different parser recovery rules and still call the implementation compatible.
 
-## Endpoint strategy
+## Endpoint and capabilities
 
-| Item | Behavior |
+| Item | Audited behavior |
 | --- | --- |
-| Endpoint | https://www.google.com/wml/search |
+| Endpoint | `https://www.google.com/wml/search` |
 | Method | GET |
-| Query encoding | Standard URL query encoding |
-| Body | None |
-| Expected response | XML-like mobile HTML; parse as HTML after removing an optional XML declaration |
-| JavaScript | Not required |
-| Redirect following | Disabled in the active provider path |
-| First-page size | Provider emits approximately ten standard results in the observed layout |
-| Maximum page | Adapter advertises page values through 50 |
+| Query encoding | `urllib.parse.urlencode` semantics |
+| Body | none |
+| Response | XML-like mobile markup parsed as tolerant HTML |
+| JavaScript | not required |
+| Paging | yes |
+| Maximum page | 50 |
+| Time range | yes: day/week/month/year |
+| Language/region | yes, through trait mappings |
+| Safe search | yes |
+| Redirect following | false in the ordinary online-engine path |
 
-**Observation:** The endpoint is described as an XML result representation, but the parser uses an HTML tree and class-based structural selection. The implementation must therefore accept HTML-compatible markup rather than require a strict XML document.
-
-**Recommendation:** Make the endpoint and parser selectors configurable constants inside the Google adapter, with fixture tests. Do not generalize them into a shared parser.
+The mobile/legacy representation is intentional. The desktop web representation is not the audited path.
 
 ## Request construction
 
-The active request has these query parameters:
+The request begins with:
 
-| Parameter | Value |
+    q=<query>
+    sca_esv=1
+
+Provider locale logic adds:
+
+    hl=<interface-language>
+    lr=<language-restriction>
+    cr=<country-restriction when applicable>
+    ie=utf8
+    oe=utf8
+
+### Language and country rules
+
+`hl` is derived from the provider language trait after removing the `lang_` prefix. `lr` receives the complete provider language trait, for example `lang_en`; when the selected locale is the all-locale value, `lr` is the empty string.
+
+When a country trait exists, `cr` is initialized to an empty string. It becomes `country<COUNTRY>` only if the caller locale contains a region component. The web path does not actively send `gl`.
+
+The trait data includes provider-specific aliases. In the audited Google trait builder, generic `zh` maps to `lang_zh-CN`, the all-region sentinel is `ZZ`, and `zh-CN` has a region alias to `HK`. A compatible implementation must use an equivalent trait snapshot/mapping rather than deriving all values mechanically from ISO codes.
+
+### Pagination
+
+Pages are one-based:
+
+    start = (page - 1) * 10
+
+`start` is omitted when the value is zero, so page one sends no `start` parameter.
+
+### Time filter
+
+| Input | Request parameter |
 | --- | --- |
-| q | User query |
-| sca_esv | 1 |
-| hl | Provider language code |
-| lr | Provider language restriction, or empty for the all-locale fallback |
-| cr | country plus provider country code when a country is selected; empty otherwise |
-| ie | utf8 |
-| oe | utf8 |
-| start | (page - 1) * 10, omitted for the first page |
-| tbs | qdr:d, qdr:w, qdr:m, or qdr:y for day/week/month/year |
-| safe | off, medium, or high when safe search is nonzero |
+| day | `tbs=qdr:d` |
+| week | `tbs=qdr:w` |
+| month | `tbs=qdr:m` |
+| year | `tbs=qdr:y` |
 
-num is deliberately omitted. **Observation:** the analyzed request path contains a note that num has no effect for this representation.
+Unsupported or absent time ranges do not add `tbs`.
 
-### Time mapping
+### Safe-search behavior
 
-| Generic option | Google parameter |
-| --- | --- |
-| day | tbs=qdr:d |
-| week | tbs=qdr:w |
-| month | tbs=qdr:m |
-| year | tbs=qdr:y |
+The provider defines the conceptual mapping:
 
-### Safe-search mapping
+    0 -> off
+    1 -> medium
+    2 -> high
 
-| Generic option | Google parameter |
-| --- | --- |
-| off | omit safe or use safe=off according to the adapter’s normalized policy |
-| moderate | safe=medium |
-| strict | safe=high |
+However, request construction adds `safe` only when the numeric setting is truthy. Therefore the **actual** request behavior is:
 
-**Observation:** The numeric search setting maps 0 to off, 1 to medium, and 2 to high. The V1 public API should map named values to these strings before request construction.
+| Setting | Exact request behavior |
+| ---: | --- |
+| 0 | omit `safe` |
+| 1 | `safe=medium` |
+| 2 | `safe=high` |
 
-## Request fingerprint
+**PARITY MUST:** do not send `safe=off` for setting 0.
 
-| Field | Observed value/policy | Classification |
-| --- | --- | --- |
-| User-Agent | Random choice from a fixed Nokia mobile User-Agent set | REQUIRED for the selected representation; exact availability is an external assumption |
-| Accept | */* | RECOMMENDED |
-| Cookie | CONSENT=YES+ | RECOMMENDED; helps avoid a consent interstitial |
-| Accept-Language | Added by the generic provider layer when enabled; locale-specific form | RECOMMENDED |
-| Browser profile | Android Chrome 99 impersonation | RECOMMENDED for matching the expected mobile request |
-| Referer | Not explicitly set | OPTIONAL |
-| Sec-Fetch-* | Not explicitly set by the provider | UNKNOWN; browser profile may supply defaults |
-| DNT / Sec-GPC | Not explicitly set | OPTIONAL |
-| Content-Type | No body; not applicable | NOT_NEEDED |
-| Redirect policy | Do not follow redirects | REQUIRED for the observed CAPTCHA detection |
+### Result-count parameter
 
-The fixed User-Agent values are legacy Nokia/Symbian profiles. The currently observed set is:
+`num` is not sent. The audited code explicitly leaves it disabled because it was observed not to affect this representation.
+
+## HTTP fingerprint
+
+### Explicit User-Agent
+
+Each request chooses one value at random from this fixed set:
 
     Nokia7610/2.0 (5.0509.0) SymbianOS/7.0s Series60/2.1 Profile/MIDP-2.0 Configuration/CLDC-1.0
     Nokia7610/2.0 (7.0642.0) SymbianOS/7.0s Series60/2.1 Profile/MIDP-2.0 Configuration/CLDC-1.0
@@ -86,146 +102,140 @@ The fixed User-Agent values are legacy Nokia/Symbian profiles. The currently obs
     Nokia6280/2.0 (03.60) Profile/MIDP-2.0 Configuration/CLDC-1.1
     NokiaN72/2.0617.1.0.3 Series60/2.8 Profile/MIDP-2.0 Configuration/CLDC-1.1
 
-A future implementation may use this exact verified list as configuration, but it must not generate an unrelated random browser identity for each header independently.
+### Browser/TLS impersonation
 
-When the generic locale layer emits Accept-Language, the observed forms are:
+The request explicitly selects the transport profile:
 
-    language,language-territory;q=0.7,en;q=0.3
+    chrome99_android
+
+This produces an intentionally unusual combination: a Nokia HTTP User-Agent together with an Android Chrome 99 curl/TLS impersonation profile. This is what the audited implementation does.
+
+**PARITY MUST:** preserve this combination for compatibility testing. Replacing the transport with stock `httpx` or `aiohttp` without equivalent browser impersonation is a behavioral change, not a transparent refactor.
+
+### Accept-Language
+
+The generic online request layer adds `Accept-Language` before the engine-specific request builder when locale headers are enabled. The forms are:
+
+    <lang>,<lang>-<territory>;q=0.7,en;q=0.3
+
+or, when no parsed locale exists:
+
     en-US,en;q=0.9
 
-The first form is used when a parsed locale is available; the second is the fallback when it is not.
+### Important helper-only values
 
-## Locale and traits
+The locale helper computes these additional values:
 
-The provider uses a locale trait table built from Google’s preferences page:
+    Accept: */*
+    CONSENT=YES+
 
-1. Request https://www.google.com/preferences with a short startup timeout.
-2. Read language options from the hl selector.
-3. Read country options from the gl selector.
-4. Map caller locales to the provider’s language and country values.
-5. Use a special all-locale sentinel when no specific locale is selected.
+but the audited Google web request builder does **not** merge the helper's `headers` or `cookies` dictionaries into the outgoing request parameters. Only the helper's query parameters are merged, followed by the explicit Nokia `User-Agent` and `chrome99_android` impersonation setting.
 
-**Observation:** The active request uses:
+**PARITY MUST:** do not claim `Accept: */*` or `CONSENT=YES+` are sent by this exact path unless the future implementation deliberately changes the behavior and records that deviation.
 
-- hl for interface language;
-- lr for language restriction;
-- cr for country restriction;
-- no active gl parameter, even though country traits are collected;
-- ZZ as the all-locale trait sentinel.
+## Redirect policy and CAPTCHA detection
 
-The observed country transformation is cr=country followed by the provider country code for a language-country locale. The Chinese mapping contains a provider-specific alias in the trait table; do not derive it from the ISO country code without consulting the trait map.
+The generic online request defaults to:
 
-**Recommendation:** Ship a small static map for common locales and refresh traits asynchronously as an optional enhancement. Never make a search wait indefinitely for a preferences scrape.
+    allow_redirects = false
+    max_redirects = 0
+    raise_for_httperror = true
 
-## URL examples
+Before result parsing, the provider performs these checks:
 
-First page, English, United States, strict safe search:
+1. response host equals `sorry.google.com` -> CAPTCHA/access-denied failure;
+2. response path starts with `/sorry` -> CAPTCHA/access-denied failure;
+3. status code is `302` -> CAPTCHA/access-denied failure;
+4. response text is shorter than 2,000 characters and contains `/sorry/` -> CAPTCHA/access-denied failure.
 
-    https://www.google.com/wml/search?q=example+query&sca_esv=1&hl=en&lr=lang_en&cr=countryUS&ie=utf8&oe=utf8&safe=high
+HTTP statuses `>= 400` are normally intercepted by the common HTTP error layer before provider parsing. A 302 is not a generic HTTP error in that layer, which is why the provider-specific 302 check matters.
 
-Second page with a week filter:
+## Response parsing
 
-    https://www.google.com/wml/search?q=example+query&sca_esv=1&hl=en&lr=lang_en&cr=countryUS&ie=utf8&oe=utf8&start=10&tbs=qdr:w
+If the response, after left whitespace, begins with an XML declaration, remove everything through the first `?>`. Parse the remaining text with tolerant HTML parsing.
 
-The exact query-string ordering is not semantically important; tests should compare decoded parameter maps rather than raw ordering.
+### Result blocks
 
-## Response inspection and anti-automation detection
+Current selectors are:
 
-Inspect the response before parsing results:
-
-1. If the final response host is sorry.google.com, classify it as CaptchaDetected.
-2. If the final response path begins with /sorry, classify it as CaptchaDetected.
-3. If redirects are disabled and the HTTP status is 302, classify it as a challenge/CAPTCHA response rather than treating the Location as a result.
-4. If the body is smaller than roughly 2,000 bytes and contains /sorry/, classify it as a CAPTCHA response.
-5. A normal HTTP error status should become an appropriate typed HTTP, blocked, or rate-limit failure.
-
-**Observation:** These checks are intentionally conservative and do not solve a challenge.
-
-**Recommendation:** Keep the size heuristic as a warning-level signal unless a fixture demonstrates that it is specific enough. Do not log the full challenge body.
-
-## Result structure
-
-The observed parser selects standard result blocks using a div class containing the provider’s current result-block marker. Within each block:
-
-- The title is taken from the result link, using the current title-link and title-span classes.
-- The destination is the link href.
-- The snippet is taken from the result description container and its description span.
-- The first image whose source contains the provider’s encrypted thumbnail marker is an optional thumbnail.
-
-The parser skips a block when title or destination is missing. Item-level errors are isolated so one malformed block does not discard the whole response.
-
-### Current protocol observations: brittle selectors
-
-The currently observed structural markers are:
-
-| Purpose | Current marker |
+| Purpose | Selector |
 | --- | --- |
-| Result block | div whose class contains zMzFAb |
-| Title link | link carrying fuLhoc |
-| Title text | span carrying CVA68e |
-| Snippet container | div carrying taTFJ |
-| Snippet text | span carrying FrIlee |
-| Thumbnail | img source containing encrypted-tbn |
-| Suggestions | table carrying HExoMb, links carrying ZWRArf |
+| Result block | `//div[contains(@class, "zMzFAb")]` |
+| Title element | `.//a[contains(@class, "fuLhoc")]//span[contains(@class, "CVA68e")]` |
+| Raw URL | `.//a[contains(@class, "fuLhoc")]/@href` |
+| Snippet | `.//div[contains(@class, "taTFJ")]//span[contains(@class, "FrIlee")]` |
+| Thumbnail | `.//img[contains(@src, "encrypted-tbn")]/@src` |
+| Suggestions | table class `HExoMb`, link class `ZWRArf` |
 
-These are public document markers, not stable API fields. Keep them in a dedicated adapter fixture and monitor them with a live smoke test.
+Per block:
 
-## Redirect unwrapping
+1. if the title element is missing, skip the block;
+2. extract title text;
+3. if the title href is missing, skip the block;
+4. unwrap the Google URL when applicable;
+5. extract snippet text, defaulting effectively to an empty string;
+6. extract the first matching thumbnail, defaulting to an empty string;
+7. emit a main result;
+8. catch any exception from that individual block, log it, skip the block, and continue parsing later blocks.
 
-When the extracted link begins with /url?q=:
+That per-item exception isolation is provider-specific and must be preserved.
 
-1. Remove the /url?q= prefix.
-2. URL-decode the remainder.
-3. Stop before the provider tracking suffix beginning with &sa=U.
-4. Require the recovered value to be an absolute URL.
+## Exact URL unwrapping
 
-If the link is already absolute and is not a provider wrapper, preserve it. If unwrapping fails, skip the item or report a parse warning; never use the provider wrapper as the canonical identity.
+The current transformation is semantically:
 
-Synthetic example:
+    if raw_url starts with "/url?q=":
+        encoded = raw_url after the first 7 characters
+        encoded = encoded split on literal "&sa=U", first part only
+        return URL-decode(encoded)
+    return raw_url unchanged
 
-    /url?q=https%3A%2F%2Fexample.test%2Fdocs%3Fx%3D1%26y%3D2&sa=U&ved=abc
-    ->
+The operation order is therefore:
+
+1. remove `/url?q=`;
+2. split on literal `&sa=U` **before decoding**;
+3. keep the first part;
+4. call URL percent-decoding;
+5. return the result.
+
+Example:
+
+    /url?q=https%3A%2F%2Fexample.test%2Fdocs%3Fx%3D1%26y%3D2&sa=U&ved=x
+
+becomes:
+
     https://example.test/docs?x=1&y=2
 
-## Pagination
+**PARITY MUST:** the provider does not add an absolute-URL or HTTP(S)-scheme validation after this unwrap. Such validation can be added at a host security boundary only as a clearly documented deliberate deviation.
 
-The page number is one-based. The offset is:
+## Trait acquisition
 
-    start = (page - 1) * 10
+The provider can build traits from:
 
-Omit start for page one. The adapter advertises a maximum page of 50, but the V1 coordinator should normally request only the first page unless the caller explicitly asks for more.
+    https://www.google.com/preferences
 
-## Minimal V1 and later work
+with a short bounded request. It reads interface-language options and country options, applies aliases, and persists the resulting trait dataset outside the critical search path in the larger application.
 
-### ESSENTIAL_V1
+For the embedded tool, equivalent behavior can be achieved by shipping a generated trait snapshot and optionally refreshing it out of band. Search execution must not depend on a live trait scrape for every query.
 
-- One GET to the mobile representation.
-- Query, locale, safe-search, and optional time-range mapping.
-- Fixed mobile User-Agent policy.
-- Accept, consent cookie, and browser-profile transport setting.
-- Redirect disabled.
-- CAPTCHA/sorry detection.
-- Current result-block/title/snippet/thumbnail extraction.
-- /url?q= destination recovery.
+## Compatibility tests
 
-### USEFUL_LATER
+At minimum, golden tests must assert:
 
-- Trait refresh and locale coverage beyond common locales.
-- Later pages.
-- Suggestions.
-- Published dates if a stable source field is identified.
+- page 1 omits `start`; page 2 sends `start=10`;
+- safe-search 0 omits `safe`; 1 sends `medium`; 2 sends `high`;
+- all four `tbs` values;
+- all-locale produces empty `lr`;
+- Nokia User-Agent is selected only from the audited set;
+- transport profile is `chrome99_android`;
+- redirects are disabled;
+- 302 and all three `/sorry` signatures are classified as CAPTCHA/access denial;
+- XML declaration removal;
+- each current XPath selector;
+- missing title/href skips one block rather than failing the provider;
+- redirect unwrapping splits before percent-decoding;
+- `Accept: */*` and `CONSENT=YES+` are not asserted as outgoing values for this exact web path.
 
-### NOT_NEEDED
+## Live validation boundary
 
-- JavaScript browser automation.
-- A commercial API key.
-- Search suggestions as main results.
-- Challenge solving.
-
-## Unknowns requiring live validation
-
-- Whether the mobile representation remains available from the deployment IP range.
-- Whether the fixed Nokia User-Agent set continues to receive the same markup.
-- Whether a 302 always indicates a challenge in every network edge.
-- Whether Google introduces additional result classes or consent pages.
-- Whether the provider’s country alias table changes.
+External behavior is mutable. Live smoke tests should verify only whether the endpoint still accepts this protocol and returns the expected structural markers. If live behavior changes, update fixtures and this protocol document before changing implementation behavior.
