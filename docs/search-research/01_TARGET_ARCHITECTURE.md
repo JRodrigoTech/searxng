@@ -2,211 +2,260 @@
 
 ## Design goal
 
-Build a small library, embedded in an existing asynchronous AI runtime, with one public search operation and three provider adapters. Provider-specific HTTP details must stop at the adapter boundary. The coordinator must not contain CSS selectors, cookies, provider redirect decoding, or token-generation rules.
+Build a small embedded search library with one public search operation and three primary provider adapters. The architecture may be idiomatic for the host runtime, but the behavior inside the compatibility pipeline must reproduce the audited provider, normalization, merge, ranking, deadline, and failure semantics.
+
+The target is not a search website and not a server. It is a callable tool implementation.
 
 ## Component diagram
 
-    Search API
+    Search Tool API
         |
         v
     SearchCoordinator
         |
-        +--> LocaleMapper
-        +--> ProviderRegistry
-        +--> DeadlineController
-        +--> ProviderTaskGroup
-                         |
-                         +--> GoogleProvider
-                         +--> BingProvider
-                         +--> DuckDuckGoProvider
-                                      |
-                                      +--> SearchTransport
-                                      +--> ProviderStateStore
+        +--> Capability/Suspension Gate
+        +--> Shared Deadline
+        +--> LocaleTraits
+        +--> Provider Registry
+                    |
+                    +--> GoogleProvider
+                    +--> BingProvider
+                    +--> DuckDuckGoHtmlProvider
+                    |
+                    +--> SearchTransport
+                    +--> ProviderState
         |
-        +--> ResultNormalizer
-        +--> UrlIdentity
-        +--> ResultMerger
-        +--> ResultRanker
-        +--> SearchResponse
+        v
+    CommonNormalizer
+        |
+        v
+    IdentityMerge
+        |
+        v
+    CompatibilityRanker
+        |
+        v
+    CompatibilityGrouping
+        |
+        v
+    Host Output Policy
+        |
+        v
+    SearchResponse
 
-The transport is shared, but every provider owns its request construction and response parser. The state store is a narrow capability used by DuckDuckGo for validation-token caching; it must not become a general application session store.
+## Architectural invariant: provider details stop at provider boundary
 
-## Responsibilities
+The coordinator must not contain provider-specific:
 
-### Search API
+- endpoints;
+- HTML/XPath selectors;
+- cookies;
+- wrapper formats;
+- CAPTCHA signatures;
+- User-Agent lists;
+- continuation-token fields.
 
-**Responsibility**
+Each provider owns those details.
 
-- Validate the public request.
-- Supply defaults.
-- Call the coordinator.
-- Return a typed response suitable for an AI tool.
+The aggregation layer likewise must not know how a result was scraped; it sees normalized result fields, provider identity, position, and ranking metadata.
 
-**Must not know**
+## Search Tool API
 
-- Provider-specific endpoint URLs.
-- HTML selectors.
-- Cookie names.
-- Redirect wrapper formats.
-- Anti-bot page signatures.
+Responsibilities:
 
-### SearchCoordinator
+- validate caller input;
+- map the public call to an internal `SearchRequest`;
+- invoke the coordinator;
+- apply only explicit host output/security policy after compatibility ordering;
+- serialize a bounded result for the agent.
 
-**Responsibility**
+It must not:
 
-- Establish the monotonic deadline.
-- Resolve requested providers and locale capabilities.
-- Ask each adapter to build a provider request.
-- Dispatch eligible work concurrently.
-- Convert exceptions into typed provider outcomes.
-- Feed successful provider results to normalization, merge, and ranking.
-- Enforce the final result limit.
+- fetch result destinations;
+- reinterpret snippets as instructions;
+- expose provider cookies/tokens;
+- select arbitrary provider protocol fields supplied by the model.
 
-**Must not know**
+## SearchCoordinator
 
-- How a provider obtains or decodes a destination URL.
-- How a provider extracts a validation token.
-- The raw response document structure.
+Responsibilities:
 
-### SearchProvider
+- capture the common monotonic start;
+- derive the common search timeout;
+- check provider capability and suspension state;
+- start all eligible providers concurrently;
+- isolate failures;
+- reject late results;
+- feed accepted provider outputs through normalization and aggregation in accepted insertion/completion order;
+- close/rank/group the aggregate;
+- apply final result limit.
 
-Each provider implements four conceptual operations:
+The source implementation uses worker threads. The target can use asyncio directly as long as shared-deadline, partial-failure, late-result, and parity-sensitive insertion-order behavior are preserved.
 
-1. capabilities() — supported page, time, language, region, and safe-search features.
-2. prepare(request, deadline) — produce an immutable provider request or an explicit unsupported outcome.
-3. execute(provider_request, transport, deadline) — perform the provider call and decode provider-level state.
-4. parse(response) — return provider results, optional provider metadata, and typed parse/block failures.
+## Provider contract
 
-The actual Python API may combine operations, but the boundary should remain visible in tests.
+A provider needs conceptual operations equivalent to:
 
-### SearchTransport
+    capabilities(request) -> eligible | unsupported
+    prepare(request, context) -> PreparedRequest | no-request | failure
+    execute(prepared, transport, state, deadline) -> ProviderOutput
 
-**Responsibility**
+The actual Python interface may combine them, but tests must separately verify request preparation and response parsing.
 
-- Async GET and POST.
-- Pooled connections.
-- TLS verification.
-- compression decoding.
-- bounded response reads.
-- redirect policy.
-- per-call remaining-time handling.
-- optional HTTP/2 or HTTP/3 selection.
+## SearchTransport
 
-**Must not know**
+Compatibility responsibilities:
 
-- Which response class means a CAPTCHA.
-- How a search result is ranked.
-- Which cookie maps to a locale.
+- curl-compatible async HTTP;
+- browser/TLS impersonation profiles;
+- HTTP/2 and conditional HTTP/3;
+- explicit cookies/headers;
+- redirect policy;
+- pooled client reuse keyed by transport settings;
+- shared remaining-time propagation;
+- generic HTTP error classification;
+- retry behavior.
 
-### LocaleMapper
+Transport must not know:
 
-**Responsibility**
+- result XPath selectors;
+- provider wrapper decoding;
+- global ranking;
+- prompt/security interpretation of snippets.
 
-- Parse user language/region input.
-- Produce provider-specific language, market, or region values.
-- Apply a documented fallback.
-- Report unsupported locale as data, not as an exception that destroys the entire search.
+## LocaleTraits
 
-Provider locale mappings are not interchangeable. Google, Bing, and DuckDuckGo use different strings and different notions of “market”.
+The locale layer owns:
 
-### ResultNormalizer
+- provider trait snapshots;
+- all-locale sentinels;
+- provider aliases;
+- best-fit language/region mapping.
 
-**Responsibility**
+It must produce exactly the provider codes expected by adapter request builders.
 
-- Convert provider output to a common result.
-- Collapse whitespace.
-- Require an absolute destination URL.
-- Preserve 1-based provider position.
-- Remove known provider redirect wrappers before identity calculation.
-- Bound text and metadata.
+Trait refresh is an offline/background maintenance concern. Ordinary search must work from the bundled snapshot.
 
-### UrlIdentity
+## ProviderState
 
-**Responsibility**
+Primary DuckDuckGo requires provider-scoped TTL state for `vqd`. The cache identity includes the transformed query and stable User-Agent.
 
-- Produce a conservative stable identity string.
-- Leave the display URL available for the caller.
-- Avoid merging URLs merely because they look similar.
+The state boundary must prevent:
 
-See 10_URL_IDENTITY_AND_DEDUPLICATION.md.
+- cross-provider state access;
+- accidental User-Agent/token mismatch;
+- unbounded cache growth;
+- token exposure through public results.
 
-### ResultMerger
+An optional secondary DDG adapter uses additional page-URL cache state, but it is not part of primary V1.
 
-**Responsibility**
+## CommonNormalizer
 
-- Detect equal identities.
-- Preserve every provider and position observation.
-- Select the best available display fields according to deterministic rules.
-- Preserve useful metadata instead of overwriting it arbitrarily.
+Responsibilities are exact compatibility transformations:
 
-### ResultRanker
+- common text whitespace/length rules;
+- duplicate content/title suppression;
+- parsed URL initialization;
+- missing-scheme behavior;
+- observed IDNA behavior;
+- provider provenance initialization.
 
-**Responsibility**
+Do not add product canonicalization here.
 
-- Calculate a reproducible score from provider, provider position, and consensus.
-- Use explicit provider weights.
-- Apply deterministic tie-breaking.
-- Be independent of HTML parsing and transport state.
+## IdentityMerge
 
-## Recommended data ownership
+Responsibilities:
+
+- construct an identity equivalent to the audited fields;
+- detect both same-provider and cross-provider duplicates through one global map;
+- append every accepted duplicate position;
+- merge title/content/default fields/provenance/scheme exactly.
+
+No one-vote-per-provider policy belongs here in parity mode.
+
+## CompatibilityRanker
+
+Responsibilities:
+
+- configured provider weights;
+- exact weight-product and position-count formula;
+- priority behavior;
+- score assignment when aggregation closes;
+- first-pass stable descending score sort.
+
+No alternate consensus formula is used in the default compatibility path.
+
+## CompatibilityGrouping
+
+After score sort, reproduce the second ordering pass using:
+
+- primary provider category;
+- template;
+- image marker from thumbnail/img_src;
+- group capacity 8;
+- max distance 20.
+
+This is a distinct stage and should have its own tests because omitting it changes output order.
+
+## Host Output Policy
+
+Only after compatibility ordering should Overmind-specific controls act on agent-facing output, for example:
+
+- reject/quarantine unsafe URL schemes;
+- enforce final serialized field bounds;
+- attach labelled provenance;
+- remove internal diagnostic state.
+
+Keeping this boundary after compatibility aggregation allows security hardening without corrupting provider/ranking parity tests.
+
+## Data ownership
 
 | Data | Owner | Lifetime |
 | --- | --- | --- |
-| Query, limit, locale, filters | SearchRequest | One search |
-| Per-provider capability flags | Provider adapter | Process lifetime or static configuration |
-| HTTP connection pool | SearchTransport | Process/runtime lifetime |
-| DuckDuckGo validation token | ProviderStateStore | Bounded TTL |
-| Raw response bytes | Provider execution | One request; discard after parsing |
-| Provider result | Provider adapter | One search |
-| Canonical result | Normalizer/merger | One search |
-| Telemetry counters | Observability sink | Configurable |
+| Query/options | SearchRequest | one search |
+| Provider capabilities | provider | process/configuration lifetime |
+| Trait snapshot | LocaleTraits | release/process lifetime |
+| HTTP pools | SearchTransport | runtime lifetime |
+| Stable DDG User-Agent | provider instance/module-equivalent | runtime lifetime |
+| DDG `vqd` | ProviderState | 3600 s |
+| Raw provider response | provider execution | one request |
+| Normalized result | compatibility pipeline | one search |
+| Aggregated result | compatibility pipeline | one search |
+| Suspension state | provider health layer | across searches |
+| Agent-facing result | tool response | one call |
 
-Do not put cookies, validation tokens, or raw HTML into the returned SearchResponse.
+## Primary V1 versus optional later work
 
-## V1 and later
+### Primary V1
 
-### ESSENTIAL_V1
+- Google web adapter;
+- Bing web adapter;
+- DuckDuckGo HTML adapter;
+- curl-compatible transport profiles;
+- trait mapping;
+- shared deadline;
+- exact normalization/dedupe/merge/ranking/grouping;
+- provider failure isolation;
+- tool serialization.
 
-- One asynchronous public method.
-- Three fixed providers.
-- First-page support for all providers.
-- Provider-specific safe search where verified.
-- Google and DuckDuckGo time filters where verified.
-- Bing market/region support.
-- Shared total deadline.
-- Typed partial failure.
-- Conservative URL identity.
-- Provenance-preserving merge.
-- Deterministic ranking.
+### Optional later
 
-### USEFUL_LATER
+- secondary DuckDuckGo JSON/script adapter;
+- trait refresh command/job;
+- richer provider diagnostics;
+- persistent cache if V1 initially uses in-memory state;
+- alternative ranking modes clearly separated from compatibility.
 
-- Provider-specific page counts beyond the first page.
-- Periodic trait/locale refresh.
-- Persistent encrypted token cache across process restarts.
-- Adaptive provider weights.
-- Circuit breaking across searches.
-- More detailed provider health metrics.
-- Optional answer/infobox results as separate result types.
+## Non-goals
 
-### NOT_NEEDED
+- web server/UI;
+- arbitrary fetch/crawler;
+- provider plugin ecosystem;
+- browser automation;
+- search index;
+- generic JavaScript runtime;
+- copying a larger application's application/session layers.
 
-- Search website templates.
-- User-facing engine selection pages.
-- General category registries.
-- Media, files, maps, news, and social result types.
-- A plugin installation mechanism.
-- A public server endpoint.
-- Arbitrary result-page fetching.
+## Architecture acceptance criteria
 
-## Architectural invariants
-
-1. A provider can fail without invalidating another provider’s results.
-2. A provider cannot mutate another provider’s request or state.
-3. A deadline is monotonic and never extended by a slow provider.
-4. A provider position starts at one and is assigned before duplicate merging.
-5. A merged result keeps provider provenance and all observed positions.
-6. Display URL and identity URL are separate values.
-7. Provider text is untrusted data.
-8. The parser never executes JavaScript supplied by a provider.
-9. The output is bounded even if a response is unexpectedly large.
+A new implementation is architecturally correct only if provider protocol tests and global compatibility tests can be run separately. Replacing an internal mechanism is allowed; changing its observable behavior is not, unless recorded as an explicit deviation.
