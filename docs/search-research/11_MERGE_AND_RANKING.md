@@ -1,196 +1,210 @@
 # Merge and ranking
 
-## Observed merge behavior
+## Compatibility target
 
-When two results have the same observed identity, the analyzed behavior:
+This document defines the exact merge and ordering behavior that the embedded search tool should reproduce before projecting results to the agent.
 
-- combines provider names in a set;
-- appends each provider position to an unlabelled position list;
-- prefers the longer title;
-- prefers the longer snippet/content;
-- fills empty fields from the other result;
-- prefers a secure URL scheme over a non-secure one;
-- preserves other populated fields unless a better field is selected.
+There are three distinct phases:
 
-The behavior does not retain a provider-to-position association in the position list. The independent design below should improve that loss of context.
+1. normalize and merge equal identities;
+2. compute scores when the container closes;
+3. sort by score, then run a category/template/image grouping pass.
 
-## Independent merge model
+The third phase is easy to miss and can change the final order even after scoring.
 
-For every identity, retain:
+## Merge behavior
 
-    providers: set[str]
-    observations: list[
-        {
-          provider: str,
-          position: int,
-          url: str,
-          title: str,
-          snippet: str
-        }
-    ]
+When a duplicate arrives, the existing result is mutated.
 
-The provider-local normalizer must collapse duplicate identities from one provider before this stage. Thus a provider contributes at most one ranking observation per canonical destination.
+### Content
 
-## Field merge policy
+If the incoming `content` is longer than the existing content, replace the existing content.
 
-| Field | Merge rule |
-| --- | --- |
-| Identity | Must be equal under the configured URL policy |
-| Display URL | Prefer HTTPS; otherwise prefer the first valid URL; preserve all observed URLs |
-| Title | Prefer non-empty; then prefer the longer bounded title; tie-break by earliest observation |
-| Snippet | Prefer non-empty; then prefer the longer bounded snippet; tie-break by earliest observation |
-| Published date | Prefer a valid date; if two conflict, keep earliest-observed value and record a conflict flag |
-| Thumbnail | Prefer a valid non-empty value; do not fetch it |
-| Metadata | Union allowlisted keys; do not overwrite a non-empty value with empty data |
-| Providers | Set union |
-| Positions | Keep labelled observations |
+### Title
 
-“Longer” is a useful heuristic for the observed behavior, but not a claim that longer text is more accurate. The bounds and tie-break rule make it deterministic.
+If the incoming title is longer than the existing title, replace the existing title.
 
-## Merge examples
+### Other default fields
 
-### Different titles and snippets
+The result model copies fields from the incoming result according to its default-field semantics when the existing result lacks a usable value. Exact field-copy details depend on typed versus legacy result representation, but this happens before provenance/scheme updates.
 
-Provider A:
+### Engine provenance
 
-    title: API guide
-    snippet: Short description
-    position: 1
+Add the incoming result's engine name to the existing result's `engines` set.
 
-Provider B:
+### URL scheme preference
 
-    title: Complete API guide for clients
-    snippet: Longer description with useful context
-    position: 2
+If the existing parsed URL scheme does not end with `s`, but the incoming duplicate's scheme does end with `s`, replace the existing scheme with the incoming secure-suffixed scheme and regenerate the displayed URL.
 
-Merged:
+This is broader than only `http -> https`; the source test is literally whether the scheme string ends in `s`.
 
-    title: Complete API guide for clients
-    snippet: Longer description with useful context
-    providers: A, B
-    observations: A@1, B@2
+### Position
 
-### HTTP and HTTPS
+After merge, append the incoming provider-local position to the existing unlabelled `positions` list.
 
-Provider A returns http://example.test/docs at position 2.
-Provider B returns https://example.test/docs at position 1.
+There is no “best position only” reduction and no one-position-per-provider rule.
 
-If the identity policy treats HTTP and HTTPS as equivalent, the merged display URL is HTTPS, both observations remain, and the ranking sees positions 2 and 1.
+## Exact score calculation
 
-### Conflicting published dates
+Start:
 
-Provider A reports January 1.
-Provider B reports January 3.
+    weight = 1.0
 
-Do not invent a reconciliation. Keep the first valid date, add a bounded conflict marker, or leave the merged date unset. The choice must be stable and tested.
+For every engine name in the merged result's `engines` set, when that engine has a configured weight:
 
-## Observed ranking semantics
+    weight *= engine_weight
 
-The analyzed score calculation has these steps:
+Then:
 
-1. Start with weight 1.
-2. Multiply by the configured weight of every distinct provider present in the merged result.
-3. Multiply by the number of provider positions/observations.
-4. For normal priority, add weight divided by each position.
-5. For high priority, add weight once per position.
-6. For low priority, leave the score at zero.
+    weight *= len(positions)
 
-With provider weights all equal to one, the normal-priority formula is:
+Initialize:
 
-    score = number_of_observations * sum(1 / position)
+    score = 0
 
-With provider weights:
+For each position:
 
-    score = (number_of_observations
-             * product(provider_weight for each provider))
-             * sum(1 / position)
+- priority `low`: contribute nothing;
+- priority `high`: add `weight`;
+- ordinary priority: add `weight / position`.
 
-This product behavior can grow quickly when more than one provider weight exceeds one. Treat it as an observation to reproduce in compatibility tests, not as the default recommendation for a new subsystem.
+For normal web results, the formula is therefore:
 
-## Worked ranking example
+    score = (
+        product(weight_of_each_engine)
+        * number_of_positions
+        * sum(1 / position for position in positions)
+    )
 
-Assume equal provider weights and normal priority:
+With all provider weights at the default 1.0:
+
+    score = len(positions) * sum(1 / position)
+
+## Important scoring consequences
+
+- repeated appearances increase score through both the reciprocal-position sum and the multiplier `len(positions)`;
+- duplicate occurrences from one provider can also increase score because positions are not provider-labelled and are not collapsed first;
+- engine weights are multiplied together, not added;
+- engine set iteration order does not affect multiplication mathematically, aside from ordinary floating-point effects;
+- low-priority results score zero;
+- high-priority results ignore actual numeric position except through the number of positions already included in `weight`.
+
+## Worked example
+
+Equal engine weights, ordinary priority:
 
 Provider A:
 
-    R1 at position 1
-    R2 at position 2
+    R1 @ 1
+    R2 @ 2
 
 Provider B:
 
-    R2 at position 1
-    R1 at position 3
+    R2 @ 1
+    R1 @ 3
 
 Provider C:
 
-    R1 at position 2
+    R1 @ 2
 
-R1 appears three times at positions 1, 3, and 2:
+For R1:
 
-    observation count = 3
-    position sum = 1/1 + 1/3 + 1/2
-                   = 1 + 0.333333 + 0.5
-                   = 1.833333
-    score(R1) = 3 * 1.833333
-              = 5.5
+    positions = [1, 3, 2]
+    weight = 1 * 3 = 3
+    score = 3/1 + 3/3 + 3/2
+          = 3 + 1 + 1.5
+          = 5.5
 
-R2 appears twice at positions 2 and 1:
+For R2:
 
-    observation count = 2
-    position sum = 1/2 + 1/1
-                   = 0.5 + 1
-                   = 1.5
-    score(R2) = 2 * 1.5
-              = 3.0
+    positions = [2, 1]
+    weight = 1 * 2 = 2
+    score = 2/2 + 2/1
+          = 1 + 2
+          = 3.0
 
-Therefore the observed score order is R1, then R2 before any later category-grouping pass.
+First-pass score order is R1 then R2.
 
-## Additional observed ordering
+## Container close
 
-After score sorting, the analyzed result container performs a second grouping pass for certain category/template/image groups. It can move related results closer together and limits the number of results per group and a distance window.
+When the result container closes, score is calculated once for every merged main result. The score is also attributed into engine metrics for every engine in that result's provenance set.
 
-**Recommendation:** Do not carry this application-specific grouping into V1. It makes ranking harder to explain and can violate the caller’s expectation that score order is final. If grouping is later required, make it a named post-ranker with its own tests.
+No further duplicate merge should occur after close.
 
-## Recommended simplified V1 ranking
+## First ordering pass
 
-Use distinct-provider observations, one per provider, and a capped consensus multiplier:
+Main results are sorted by:
 
-    base = sum(provider_weight / position
-               for each distinct provider observation)
+    score descending
 
-    consensus = 1 + 0.35 * min(distinct_provider_count - 1, 2)
+Python's sort is stable. There is no explicit secondary key such as provider count, canonical identity, title, or URL.
 
-    score = base * consensus
+Therefore equal-score ordering follows the insertion order of the merged values, which can depend on provider completion/insertion timing.
 
-Recommended default weights start at one for all three providers. The multiplier then becomes:
+**PARITY MUST:** do not introduce an explicit tie-break in compatibility mode.
 
-| Distinct providers | Consensus factor |
-| ---: | ---: |
-| 1 | 1.00 |
-| 2 | 1.35 |
-| 3 | 1.70 |
+## Second ordering/grouping pass
 
-Properties:
+After score sorting, the audited container performs another pass.
 
-- position one contributes more than position two;
-- agreement increases confidence;
-- the consensus bonus is capped;
-- a single provider cannot receive multiple consensus bonuses for duplicate blocks;
-- the formula is deterministic and easy to test.
+For each result, it determines a category using the first configured category of the result's single primary/origin `engine` field when available.
 
-Alternative scoring functions can be evaluated later, but the implementation should store component contributions for explainability.
+It builds a group key equivalent to:
 
-## Tie-breaking
+    category
+    + template
+    + image-marker
 
-After descending score, sort by:
+where the image marker is present if either `thumbnail` or `img_src` is non-empty.
 
-1. distinct provider count descending;
-2. best provider position ascending;
-3. canonical identity ascending;
-4. display title using Unicode code-point order.
+The grouping state uses:
 
-Do not use task completion order or dictionary insertion order as an implicit tie-break.
+    max_count = 8
+    max_distance = 20
 
-## Priority classes
+When a compatible group has already been seen, still has group capacity, and is less than `max_distance` from the current output position, the result is inserted at the group's stored index rather than appended normally. Stored group indexes are then adjusted and the group's remaining count is decremented.
 
-The analyzed application can mark certain results high or low priority through unrelated host rules. This is NOT_NEEDED for the web-search V1. If a future caller supplies priority, make it explicit in SearchRequest and document how it interacts with the normal score; do not silently import host heuristics.
+Otherwise the result is appended and a new/current group state is recorded.
+
+### Why this matters for the three web providers
+
+All three providers normally belong to the general/web family, but image-marker differences can split groups. Google ordinary web results can include a thumbnail while Bing and primary DuckDuckGo generally do not populate that field in the audited parser. Therefore this second pass can change pure score order.
+
+A tool that returns `sorted(results, key=score)` and stops is not exact parity.
+
+## Primary engine versus provenance set
+
+A merged result contains:
+
+- `engine`: one primary/origin engine value;
+- `engines`: all engines that contributed to the merged result.
+
+The grouping pass derives category from the singular `engine`, not from every provider in `engines`. This distinction must be preserved if exact final ordering matters.
+
+## Output limit
+
+The audited result container itself computes and exposes the ordered collection; product/UI layers can then limit what they display. For Overmind, apply the tool's final `limit` **after** compatibility merge, score calculation, and grouping so early truncation does not remove consensus information.
+
+## Compatibility golden tests
+
+Tests must cover:
+
+- longer title wins;
+- longer content wins;
+- secure-suffixed scheme replaces insecure scheme when identities merge;
+- provider engine set union;
+- every duplicate appends its position;
+- same-provider duplicates also append positions;
+- exact normal-priority formula;
+- non-default engine weights multiply;
+- low priority produces zero;
+- high priority adds the common weighted value per position;
+- stable equal-score ordering follows insertion order;
+- post-score grouping can reorder results;
+- grouping key distinguishes image-bearing from non-image result groups;
+- `max_count=8` and `max_distance=20` behavior;
+- final result limit is applied after compatibility ordering.
+
+## Deliberate deviations
+
+A simpler reciprocal-rank score, capped consensus bonus, one-vote-per-provider policy, explicit deterministic tie-break, or removal of the grouping pass may be desirable for a future product ranking model. None is source parity. Keep alternative ranking behind an explicit mode and never use it in compatibility golden tests.
