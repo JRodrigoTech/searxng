@@ -1,313 +1,340 @@
 # DuckDuckGo Web Search protocol
 
-## Active path and alternatives
+## Status and compatibility target
 
-The ordinary active path is the no-JavaScript HTML interface:
+There are two distinct general-web implementations in the audited codebase. They must not be conflated:
 
-| Item | Active behavior |
+1. **Primary HTML adapter** — enabled in the audited default configuration. It POSTs to the no-JavaScript HTML endpoint, extracts result blocks, and uses a query/User-Agent-bound `vqd` value for continuation pages.
+2. **Secondary JSON/script adapter** — disabled in the audited default configuration. It first discovers a provider-generated `d.js` URL from the normal web page and then consumes JSON-like API responses. It has its own pagination cache and arithmetic challenge path.
+
+For the three-provider tool, **PARITY V1 uses the primary HTML adapter**. The secondary adapter is documented so no useful behavior is lost and can later be implemented as an explicit fallback/alternate provider mode.
+
+---
+
+# A. Primary HTML adapter
+
+## Endpoint and capabilities
+
+| Item | Audited behavior |
 | --- | --- |
-| Endpoint | https://html.duckduckgo.com/html/ |
+| Endpoint | `https://html.duckduckgo.com/html/` |
 | Method | POST |
-| Body | application/x-www-form-urlencoded |
-| Response | HTML document |
-| JavaScript | Not required |
-| First page | Does not require a validation token |
-| Later pages | Require a query/User-Agent-bound validation token |
-| Redirect wrapper | None observed in the active HTML result links |
+| Body | `application/x-www-form-urlencoded` |
+| Response | HTML |
+| JavaScript | not required |
+| Paging | yes, stateful after page 1 |
+| Time range | yes |
+| Locale/region | yes |
+| Safe-search capability flag | true, although this request path does not add an explicit safe-search field |
+| Maximum query length | 499 characters |
 
-Other public paths are present in the analyzed code but are not the active V1 path:
+If `len(query) >= 500`, no network URL is produced and the provider is effectively skipped.
 
-- https://links.duckduckgo.com/d.js for a JavaScript/JSON-style response.
-- https://noai.duckduckgo.com/ as another public endpoint.
-- https://lite.duckduckgo.com/lite as a lightweight HTML alternative.
+## Query preprocessing
 
-**Recommendation:** Implement the HTML POST path first. Treat the JSON-style path as a separate experiment, not as a silent fallback, because it has a different state machine and an anti-automation challenge path.
+Recognized external `!bang` tokens are quoted before submission to prevent an external redirect. The algorithm splits around whitespace, drops pure-whitespace pieces, wraps recognized bang tokens in single quotes, then rejoins tokens with one space.
 
-## State machine
+This means whitespace in the submitted query can differ from the caller's original formatting. The transformed query is also the value used when storing/retrieving continuation state.
 
-    NEW QUERY
-       |
-       v
-    choose stable process-level User-Agent
-       |
-       v
-    build first-page browser-like POST
-       |
-       v
-    HTML response
-       |
-       +--> challenge form
-       |       |
-       |       +--> CaptchaDetected; no solver
-       |
-       +--> result blocks
-       |       |
-       |       +--> return first-page results and cache vqd if present
-       |
-       +--> empty/redirect status
-               |
-               +--> return an explicit empty or degraded outcome
+## Stable User-Agent and `vqd` identity
 
-    LATER PAGE
-       |
-       v
-    look up token by query + User-Agent
-       |
-       +--> absent
-       |       |
-       |       +--> do not send a tokenless page request
-       |             return a typed validation/CAPTCHA failure
-       |
-       +--> present
-               |
-               v
-          build tokenized POST
-               |
-               v
-          parse result blocks or classify challenge
+A generated browser User-Agent is created once at module/process initialization and reused by this adapter.
 
-**Observation:** The token is cached after parsing a hidden input named vqd from the form containing the results. It is not a general session token.
+The continuation token cache key is a secret hash of:
 
-## Query constraints and first-page request
+    <transformed-query> + "//" + <User-Agent>
 
-Queries with length 500 characters or more are rejected by the active adapter before a network request. The V1 adapter should return UnsupportedQuery or InvalidRequest rather than truncating the user query.
+The token value expires after 3,600 seconds.
 
-The first-page form contains:
+**PARITY MUST:** the User-Agent must remain stable while a token may be reused. Rotating the User-Agent independently between page 1 and later pages breaks the observed token identity.
 
-| Field | Value |
+The audited implementation stores this state in a provider-scoped persistent engine cache. An in-memory TTL cache can reproduce per-process behavior but is a deliberate persistence deviation and must be documented/tested if chosen for the embedded tool.
+
+## Request headers
+
+The adapter explicitly sets:
+
+    User-Agent: <stable generated browser UA>
+    Sec-Fetch-Dest: document
+    Sec-Fetch-Mode: navigate
+    Sec-Fetch-Site: same-origin
+    Sec-Fetch-User: ?1
+    Referer: https://html.duckduckgo.com/
+    Content-Type: application/x-www-form-urlencoded
+
+The common online layer normally supplies `Accept-Language` first. If it did not, the adapter adds its own fallback based on the selected locale.
+
+## First-page form
+
+The first-page form contains at least:
+
+    q=<transformed query>
+    b=
+    kl=<region>
+
+`vqd`, `nextParams`, `api`, `o`, `v`, `dc`, and `s` are not added on page 1.
+
+### Region behavior
+
+The all-region provider value is:
+
+    wt-wt
+
+For all-region:
+
+    form kl=wt-wt
+    no kl cookie
+
+For a specific region:
+
+    form kl=<provider-region>
+    cookie kl=<provider-region>
+
+Trait mapping must be used rather than constructing all region strings naively. The provider has explicit aliases and custom language-region mappings.
+
+### Time range
+
+| Input | `df` value |
 | --- | --- |
-| q | Query text, with recognized external bang tokens quoted in the observed path |
-| b | Empty string |
+| day | `d` |
+| week | `w` |
+| month | `m` |
+| year | `y` |
 
-The first request has no vqd, nextParams, api, o, v, dc, or s fields.
+When a supported time range exists, the adapter sets **both**:
 
-The query is form-encoded. Do not build the body by string concatenation.
+    form df=<value>
+    cookie df=<value>
 
-## Later-page request
+With no supported time range, neither is added.
 
-For page values greater than one, the observed form contains:
+### Safe search
 
-| Field | Value |
+The adapter advertises safe-search support at the capability level, but the audited HTML request builder does not add a safe-search form field or cookie based on the numeric setting.
+
+**PARITY MUST:** do not invent a safe-search request parameter for this path. If the host requires guaranteed strict filtering, that product policy must be layered separately and must not be described as source parity.
+
+## Continuation pages
+
+For page > 1, first retrieve the cached `vqd` for the transformed query and stable User-Agent.
+
+If no token exists, raise the provider CAPTCHA/access-denied class with `suspended_time=0`; do **not** send a tokenless continuation request.
+
+For locales whose internal locale string starts with `zh`, page > 1 produces no request URL and returns early. This encodes the observed provider limitation where continuation was unavailable/forbidden for those locales.
+
+Continuation form fields are:
+
+    q=<same transformed query>
+    vqd=<cached token>
+    nextParams=
+    api=d.js
+    o=json
+    v=l
+    s=<offset>
+    dc=<offset + 1>
+    kl=<region>
+
+where:
+
+    offset = 10 + (page - 2) * 15
+
+Thus:
+
+| Page | `s` | `dc` |
+| ---: | ---: | ---: |
+| 2 | 10 | 11 |
+| 3 | 25 | 26 |
+| 4 | 40 | 41 |
+
+The optional `df` field/cookie is added exactly as on page 1 when a time range is selected.
+
+## Response behavior
+
+### Status 303
+
+A response with status `303` returns an empty result collection immediately. It is not converted into an exception by this provider parser.
+
+### CAPTCHA detection
+
+Parse the response HTML. If:
+
+    //form[@id="challenge-form"]
+
+exists, raise the provider CAPTCHA/access-denied class with `suspended_time=0`.
+
+This path detects but does not solve the HTML challenge.
+
+### Token extraction
+
+Find the parent element of an input named `vqd`. If present, take the first matching form, extract the first `vqd` value, and store it using:
+
+    submitted q + "//" + submitted User-Agent
+
+with a 3,600-second expiry.
+
+Absence of a `vqd` input on a normal first-page response does not by itself fail parsing; it merely means no continuation token was cached.
+
+### Main result extraction
+
+Select only:
+
+    //div[@id="links"]/div[contains(@class, "web-result")]
+
+This intentionally excludes ad-style result blocks.
+
+For each selected block, the current parser uses:
+
+| Field | Selector |
 | --- | --- |
-| q | The same query text, after the provider’s bang-quoting step |
-| vqd | Cached validation token |
-| nextParams | Empty string |
-| api | d.js |
-| o | json |
-| v | l |
-| s | offset |
-| dc | offset plus one |
-| offset | 10 + (page - 2) * 15 |
+| Title | `.//h2/a` text |
+| URL | `.//h2/a/@href`, first value |
+| Snippet | first `.//a[contains(@class, "result__snippet")]` |
 
-Examples:
+The URL is used directly; this active HTML path does not apply a provider redirect-wrapper decoder.
 
-| Page | offset | dc | s |
-| --- | ---: | ---: | ---: |
-| 2 | 10 | 11 | 10 |
-| 3 | 25 | 26 | 25 |
-| 4 | 40 | 41 | 40 |
+Important failure detail: there is no per-result broad exception guard around every field extraction. A structurally malformed selected result that lacks the indexed URL can escape the response parser and become a provider-level failure through the common processor.
 
-**Observation:** The adapter uses fifteen-result increments after the initial offset of ten. This is provider behavior, not a generic page-size assumption.
+### Zero-click answer side channel
 
-**Observation:** For locales beginning with zh, the active path suppresses pages beyond one because the observed endpoint returned HTTP/2 403 or omitted the next-page control. Keep this as a locale-specific capability restriction until live behavior changes.
+The parser also inspects:
 
-## Token state
+    //div[@id="zero_click_abstract"]
 
-### Cache key and lifetime
+When non-empty, it may emit an answer object unless the text contains diagnostic phrases including:
 
-The cache key is derived from:
+    Your IP address is
+    Your user agent:
+    URL Decoded:
 
-    query + "//" + stable_user_agent
+This is a side channel, not a normal web result. The V1 Overmind-style tool may omit answer objects from its public result projection, but doing so is an output-surface decision; it should not alter normal result extraction.
 
-The stored key is a secret hash rather than the raw concatenated value. The token lifetime is approximately 3,600 seconds. A future implementation should also store the creation time and discard a token on a validation failure.
+## Trait acquisition
 
-### Required invariants
-
-- A token must not be reused for another query.
-- A token must not be reused with another User-Agent.
-- A token must not be sent after its TTL.
-- A missing token for a later page is a provider-state failure, not a reason to send a tokenless request.
-- The token must never appear in normal logs, telemetry labels, or the returned tool response.
-
-### Process User-Agent
-
-The active adapter creates a User-Agent at import/startup and reuses it. This is materially different from selecting a fresh User-Agent for every request: the token relationship depends on stable identity.
-
-**Recommendation:** Choose one coherent browser identity per provider instance or process. If rotation is needed later, rotate the User-Agent together with token state and cooldown state.
-
-## Headers and cookies
-
-The active HTML request uses the following provider-specific fields:
-
-| Field | Value/policy | Classification |
-| --- | --- | --- |
-| User-Agent | Stable generated browser-like value | REQUIRED for token consistency |
-| Sec-Fetch-Dest | document | RECOMMENDED |
-| Sec-Fetch-Mode | navigate | RECOMMENDED |
-| Sec-Fetch-Site | same-origin | RECOMMENDED |
-| Sec-Fetch-User | ?1 | RECOMMENDED |
-| Referer | Initial origin https://html.duckduckgo.com/, then the HTML endpoint | RECOMMENDED |
-| Content-Type | application/x-www-form-urlencoded | REQUIRED |
-| Accept-Language | Locale-derived value if not already set by common transport | RECOMMENDED |
-| Cookies | kl for region; df for time filter | REQUIRED when those filters are selected |
-
-The active request sets the Referer to the endpoint after the initial setup. A future implementation should use the exact endpoint with its trailing slash consistently.
-
-The common request layer may add an Accept-Language value before the provider adds its fallback. Observed fallback construction is:
-
-    language, language-UPPERCASE; q=0.7
-
-For an all-locale request, a generic layer may still add an English fallback. The code comments and the executable header path are not fully aligned here; classify this as a live-validation item rather than an invariant.
-
-## Locale and traits
-
-DuckDuckGo region traits are derived from a provider JavaScript resource:
+The provider trait builder sets all-region to `wt-wt` and fetches a provider JavaScript resource at a versioned URL to derive region/language mappings. The audited URL is:
 
     https://duckduckgo.com/dist/util/u.7669f071a13a7daa57cb.js
 
-The startup fetch has a short timeout and parses region and language sections to create:
+The module also contains explicit mapping exceptions such as traditional-Chinese, Catalan, Indonesian, Norwegian, Japanese, Korean, Arabic, Slovenian, Thai, and Vietnamese aliases.
 
-- language-to-region mappings;
-- region-to-language mappings;
-- a custom language-region mapping for provider-specific combinations;
-- all-locale sentinel wt-wt.
+For an embedded implementation, ship an equivalent generated trait snapshot and keep refresh out of the per-query critical path. Exact broad locale parity requires equivalent best-fit trait mapping, not simple string concatenation.
 
-The active HTML request uses the resolved region in the kl form value. For the all-locale value, the form contains kl=wt-wt and no kl cookie is added. For a non-default region it also sends kl as a cookie. Language behavior is primarily carried by Accept-Language and the trait selection rather than by a verified independent HTML form language field.
+---
 
-The broader provider code contains related language-region cookie values named ad, ah, and l for other flows and special region/bang handling. They are not populated by the ordinary active HTML search path described here. Do not add them to V1 without a separate request/response fixture proving that they affect ordinary web results.
+# B. Secondary JSON/script adapter
 
-Common observed examples include:
+## Status
 
-| Caller locale | Provider-style region |
-| --- | --- |
-| en-US | us-en |
-| es-ES | es-es |
-| zh-CN | cn-zh |
-| zh-TW | tw-tzh |
-| no locale | wt-wt |
+This is a separate general-web adapter and is **disabled in the audited default configuration**. It is nevertheless real, active code and must not be described as nonexistent.
 
-These values are observations from a trait snapshot. Use a provider mapping table, not string concatenation, for production.
+Its purpose is to discover provider-generated JSON/script URLs that contain opaque parameters which cannot be reconstructed solely from `vqd`.
 
-## Time filtering
+## First-page discovery
 
-When a time range is present, set the df cookie:
+For queries shorter than 500 characters, first request:
 
-| Generic option | df value |
-| --- | --- |
-| day | d |
-| week | w |
-| month | m |
-| year | y |
+    GET https://duckduckgo.com/?q=<query>&t=h_&ia=web
 
-No time cookie is sent for an unset filter. The V1 request should reject unsupported time values before building the form.
+with:
 
-## Safe search
+    impersonate=firefox
+    default_headers=false
+    timeout=2
 
-**Observation:** The active HTML request advertises safe-search support at the adapter capability level, but the observed request construction does not add a verified safe-search form parameter or cookie.
+Parse the returned HTML and extract the href of:
 
-**Recommendation:** Do not claim strict safe-search semantics for DuckDuckGo V1 until a live request and fixture establish the correct field. Options:
+    link#deep_preload_link
 
-1. expose safe search as provider-agnostic intent and mark DuckDuckGo as best effort;
-2. omit DuckDuckGo when strict safe search is required;
-3. add a separately tested provider field once verified.
+That URL points to the first `links.duckduckgo.com/d.js?...` page and includes provider-generated opaque state such as `dp`.
 
-Never silently claim that the provider applied a filter it did not receive.
+Cache the discovered page-1 URL under a query/page key for 7,200 seconds.
 
-### Current protocol observations: brittle selectors
+If no preload URL is found, the adapter produces no search URL for that operation.
 
-The active parser currently relies on:
+## JSON/script request
 
-    form#challenge-form
-    input[name="vqd"]
-    div#links > div whose class contains web-result
-    h2 > a
-    a.result__snippet
+Before requesting the discovered URL:
 
-Ad-style blocks are excluded by selecting web-result rather than the ad classes.
+- replace `/d.js?` with `/d.js?o=json&`;
+- set `impersonate=firefox`;
+- set `default_headers=false`;
+- add:
 
-## Response handling
+    Accept: */*
+    Sec-Fetch-Dest: script
+    Sec-Fetch-Mode: no-cors
+    Sec-Fetch-Site: same-site
+    Referer: https://duckduckgo.com/
 
-1. A 303 response is treated as an empty outcome by the observed path.
-2. Parse the HTML document.
-3. If a form with id challenge-form exists, return CaptchaDetected and do not retry immediately.
-4. Find the form containing an input named vqd and extract the token.
-5. Store the token with its query/User-Agent key and TTL.
-6. Select result blocks under the container with id links and the web-result class.
-7. Read title from h2/a.
-8. Read snippet from the result__snippet link.
-9. Read destination from the direct href.
-10. Exclude ad-style result classes by selecting only web-result blocks.
+This adapter does not currently implement safe-search, time-range, or locale traits in its request builder.
 
-An optional zero-click abstract may be available. The observed path adds it as an answer only when it is non-empty and does not contain diagnostic text such as “Your IP address is”, “Your user agent:”, or “URL Decoded:”. V1 should omit answer objects from the main SearchResult list or return them through a separate optional field.
+## Secondary pagination
 
-## Anti-automation behavior
+For page > 1, the adapter does not reconstruct a URL. It loads a cached URL for exactly that query and requested page.
 
-Known indicators:
+The JSON results contain a continuation path in field `n` on the last result. When present, the adapter caches:
 
-- challenge-form in the returned HTML;
-- missing vqd for a requested later page;
-- HTTP 403 or similar access denial on a continuation request;
-- a tiny/non-result response that contains provider challenge text;
-- a token rejected after previously working.
+    https://duckduckgo.com + <n>
 
-The active documentation suggests that blocking may be related to the source IP as well as request/session characteristics. This is an inference, not a guarantee.
+for the next page with a one-hour expiry.
 
-Correct behavior:
+Consequently pages are sequentially stateful: requesting page 3 requires the page-3 URL to have been learned from page 2.
 
-- classify the outcome as CaptchaDetected, Blocked, or RateLimited;
-- record a cooldown;
-- return other providers’ results;
-- expire the suspect token;
-- do not solve a challenge;
-- do not rotate headers repeatedly in a tight loop;
-- do not disclose challenge HTML to the AI caller.
+## JSON result parsing
 
-## Optional JSON-style path
+Read:
 
-The inactive alternative path has a different state machine:
+    response.json()["results"]
 
-1. GET https://duckduckgo.com/?q=...&t=h_&ia=web.
-2. Use a Firefox-like browser profile and default header generation disabled.
-3. Extract a preload script link with id deep_preload_link.
-4. Cache the continuation URL for the exact query and page.
-5. Convert the d.js query to an o=json request for later pages.
-6. Parse result fields u, t, and a; cache a next path from n.
+For each item containing `u`:
 
-Its request fingerprint includes Accept */*, script/no-cors/same-site fetch fields, and a DuckDuckGo Referer. The path also contains code that evaluates a small arithmetic challenge embedded in a response. That challenge-solving behavior is explicitly NOT_NEEDED for V1 and must not be copied into the new subsystem. A challenge should instead become a typed provider failure.
+    url     = item["u"]
+    title   = HTML-to-text(item["t"])
+    content = HTML-to-text(item["a"])
 
-## Minimal V1 and later work
+Items without `u` are skipped.
 
-### ESSENTIAL_V1
+## Arithmetic challenge path
 
-- HTML POST first page.
-- Query length validation.
-- Stable User-Agent.
-- Required form fields and browser-like headers.
-- kl region and df time cookie.
-- challenge-form detection.
-- vqd extraction, bounded cache, and tokenized later-page request if pagination is enabled.
-- web-result extraction.
+If the response text contains `let jsa =`, this adapter attempts a narrow provider-specific arithmetic challenge reconstruction. It parses a small set of generated arithmetic functions, calculates the expected numeric value using multiplication or fixed browser-HTML-length constants, constructs the provider follow-up URL, and performs another GET with the same Firefox-oriented request identity.
 
-### USEFUL_LATER
+This is not arbitrary JavaScript execution; it is a hard-coded parser/evaluator for a small observed challenge grammar. Nevertheless it is an anti-automation challenge-response mechanism.
 
-- More complete trait refresh.
-- Verified safe-search field.
-- Locale-specific pagination policy.
-- Optional zero-click answer object.
-- Separate, tested JSON-style adapter.
+For **exact secondary-adapter parity**, this behavior belongs to the compatibility specification. For the primary three-provider V1, the secondary adapter is not required and this challenge path should not be implemented accidentally as part of the HTML adapter.
 
-### NOT_NEEDED
+---
 
-- JavaScript execution.
-- Arithmetic/challenge solving.
-- External bang redirect behavior.
-- Arbitrary result-page fetching.
+# C. Compatibility tests
 
-## Unknowns requiring live validation
+## Primary adapter golden tests
 
-- Whether the current token TTL remains one hour.
-- Whether the token is accepted across processes or only within the originating session/IP.
-- Whether a browser profile must match the stable User-Agent byte-for-byte.
-- Whether kl and df remain the correct cookie names and values.
-- Whether safe-search is configurable on the current HTML endpoint.
-- Whether the Chinese pagination restriction is still necessary.
+- query length 499 produces a request; 500 produces none;
+- recognized external bangs are quoted and whitespace is normalized;
+- one stable generated User-Agent is reused;
+- first page has `q`, `b`, `kl`, optional `df`, but no continuation fields;
+- region-specific `kl` appears in form and cookie; `wt-wt` has no `kl` cookie;
+- time range writes `df` to both form and cookie;
+- page 2/3/4 offsets are 10/25/40 and `dc=s+1`;
+- missing continuation `vqd` raises CAPTCHA/access-denied with zero suspension;
+- `zh*` continuation produces no request;
+- 303 returns an empty result list;
+- `challenge-form` raises CAPTCHA/access-denied with zero suspension;
+- hidden `vqd` caches for transformed-query + User-Agent with 3,600-second TTL;
+- only `web-result` blocks are parsed;
+- malformed indexed result fields can escalate to provider-level failure;
+- zero-click diagnostic strings are excluded from answer output.
+
+## Secondary adapter golden tests
+
+- first page discovers `deep_preload_link`;
+- first-page discovered URL caches for 7,200 seconds;
+- `/d.js?` becomes `/d.js?o=json&`;
+- Firefox impersonation and `default_headers=false` are set;
+- script/no-cors/same-site headers are exact;
+- result fields `u/t/a` map correctly;
+- final result `n` seeds the next page for 3,600 seconds;
+- arbitrary page skipping fails because the cached URL does not exist;
+- arithmetic challenge fixtures reproduce the narrow audited computation.
+
+## Primary V1 decision
+
+The implementation agent should build the **HTML adapter** for the initial Google+Bing+DuckDuckGo tool. The JSON/script adapter is retained in this specification as a separately testable optional adapter, not as a hidden fallback.
