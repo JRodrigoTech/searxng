@@ -2,118 +2,173 @@
 
 ## Objective
 
-This document set specifies an independent, minimal Python search subsystem for an AI-agent tool. The subsystem sends one query to Google Web Search, Bing Web Search, and DuckDuckGo Web Search, executes eligible providers concurrently, converts their replies into one canonical result model, merges equivalent destinations, ranks the merged set, and returns a bounded structured response.
+This document set specifies an independent Python web-search subsystem for an AI-agent tool. The first implementation target is **behavioral compatibility** with the audited mechanics for Google Web Search, Bing Web Search, and the primary DuckDuckGo HTML web path.
 
-The specification is deliberately narrower than a general search website. It excludes a web UI, a public HTTP server, a database-backed application, media-search categories, arbitrary page fetching, user preference pages, and provider plug-in infrastructure.
+The system sends eligible providers concurrently, normalizes their replies, merges duplicate destinations, reproduces the observed ranking/order logic, and returns a bounded structured response to the caller.
 
-All protocol observations are time-sensitive. A live endpoint, selector, challenge page, or browser fingerprint can change without notice. Statements are labelled as follows:
+The implementation is independent in package names and architecture. The compatibility target concerns observable behavior and algorithms, not copying another application's modules or server/UI infrastructure.
 
-- **Observation** — behavior verified in the analyzed code path.
-- **Inference** — a conclusion drawn from multiple observations; validate before treating it as a protocol guarantee.
-- **Recommendation** — proposed behavior for the new implementation.
-- **Unknown** — not established by the available evidence and requiring live validation or an explicit product decision.
+## Documentation rule
 
-## Scope and target flow
+Each technical statement belongs to one of these categories:
+
+- **PARITY MUST** — reproduce this behavior in the compatibility implementation.
+- **Audited behavior** — verified behavior from the analyzed executable code path.
+- **Host policy / deliberate deviation** — a useful change for the target AI runtime that is not source parity.
+- **Live validation** — external provider behavior that can drift even when our implementation is correct.
+
+When recommendations conflict with audited behavior, parity wins for the first implementation unless the deviation is explicitly named and tested.
+
+## Target flow
 
     search(request)
-      |
-      +--> prepare eligible provider requests
-      |
-      +--> Google       \
-      +--> Bing          +--> concurrent transport calls
-      +--> DuckDuckGo  /
-                         |
-                         +--> provider-specific parsing
-                         |
-                         +--> canonical normalization
-                         |
-                         +--> URL identity and duplicate merge
-                         |
-                         +--> deterministic ranking
-                         |
-                         +--> bounded SearchResponse
+       |
+       v
+    capability + suspension filtering
+       |
+       v
+    shared monotonic search deadline
+       |
+       +--> Google
+       +--> Bing
+       +--> DuckDuckGo HTML
+              (concurrently)
+       |
+       v
+    provider-specific parsing
+       |
+       v
+    exact common normalization
+       |
+       v
+    global identity merge
+       |
+       v
+    exact score calculation
+       |
+       v
+    score sort + grouping pass
+       |
+       v
+    final result limit
+       |
+       v
+    explicit host output/security policy
+       |
+       v
+    SearchResponse to agent
 
-The request deadline begins when the public search operation begins. A successful provider remains useful when another provider fails, is blocked, or exceeds the deadline.
+## Primary provider set
+
+### Google
+
+- mobile/WML public representation;
+- GET;
+- Nokia User-Agent selected from a fixed set;
+- Android Chrome 99 transport impersonation;
+- language/region/time/safe mappings;
+- explicit `/sorry`/302 challenge detection;
+- XPath extraction and Google redirect decoding.
+
+### Bing
+
+- standard HTML web search;
+- GET;
+- `q/adlt/setlang/cc` request shape;
+- no paging/time support in this adapter;
+- optional HTTP/3 transport behavior;
+- `b_algo` extraction;
+- `ck/a?u=a1...` decoding.
+
+### DuckDuckGo primary
+
+- no-JavaScript HTML endpoint;
+- POST form;
+- stable generated User-Agent;
+- navigation fetch headers;
+- region/time form+cookie state;
+- `vqd` continuation state bound to transformed query + User-Agent;
+- HTML challenge detection;
+- direct result extraction.
+
+There is also a separate disabled-by-default DuckDuckGo JSON/script adapter. It is documented completely in `06_DUCKDUCKGO_WEB_PROTOCOL.md` but is not required for the initial three-provider V1.
 
 ## Documentation map
 
 | File | Purpose |
 | --- | --- |
-| 00_INDEX.md | Scope, reading order, V1 checklist, completion gate |
-| 01_TARGET_ARCHITECTURE.md | Independent component architecture and boundaries |
-| 02_SEARCH_PIPELINE.md | End-to-end execution sequence and data flow |
-| 03_PROVIDER_CONTRACT.md | Adapter, transport, parser, capability, and failure contracts |
-| 04_GOOGLE_WEB_PROTOCOL.md | Google public-web request and parsing behavior |
-| 05_BING_WEB_PROTOCOL.md | Bing public-web request, locale, parsing, and redirect decoding |
-| 06_DUCKDUCKGO_WEB_PROTOCOL.md | DuckDuckGo HTML flow, token state, pagination, and blocks |
-| 07_HTTP_TRANSPORT.md | Minimal transport, pooling, redirects, retry, TLS, and compression policy |
-| 08_CONCURRENCY_AND_DEADLINES.md | Shared deadline and partial-failure algorithm |
-| 09_RESULT_MODEL_AND_NORMALIZATION.md | Raw, provider, canonical, merged, and final result representations |
-| 10_URL_IDENTITY_AND_DEDUPLICATION.md | Conservative canonical identity and duplicate rules |
-| 11_MERGE_AND_RANKING.md | Field merge policy, provenance, observed scoring, and V1 ranking |
-| 12_FAILURE_AND_RESILIENCE.md | Typed failures, retry policy, suspension, and degradation |
-| 13_SECURITY_BOUNDARIES.md | Untrusted search data and transport/security boundaries |
-| 14_TEST_STRATEGY.md | Unit, fixture, concurrency, regression, and optional live tests |
-| 15_DEPENDENCIES.md | Dependency choices, alternatives, and V1 minimum |
-| 16_IMPLEMENTATION_BLUEPRINT.md | Proposed package shape, APIs, responsibilities, and call sequence |
-| 17_OPEN_QUESTIONS.md | Items that require live validation or product decisions |
+| `00_INDEX.md` | Scope, parity rules, reading order, completion gate |
+| `01_TARGET_ARCHITECTURE.md` | Independent component architecture while preserving compatibility semantics |
+| `02_SEARCH_PIPELINE.md` | Exact end-to-end execution and phase order |
+| `03_PROVIDER_CONTRACT.md` | Common provider/transport/capability contract |
+| `04_GOOGLE_WEB_PROTOCOL.md` | Exact Google request, fingerprint, parser, block, unwrap behavior |
+| `05_BING_WEB_PROTOCOL.md` | Exact Bing request/parser/wrapper/failure behavior |
+| `06_DUCKDUCKGO_WEB_PROTOCOL.md` | Primary HTML path plus secondary JSON/script path |
+| `07_HTTP_TRANSPORT.md` | curl/browser impersonation, HTTP versions, pooling, retries, deadlines |
+| `08_CONCURRENCY_AND_DEADLINES.md` | Shared deadline, concurrent dispatch, late-result suppression |
+| `09_RESULT_MODEL_AND_NORMALIZATION.md` | Exact common result normalization and positions |
+| `10_URL_IDENTITY_AND_DEDUPLICATION.md` | Exact identity fields and global dedupe behavior |
+| `11_MERGE_AND_RANKING.md` | Exact merge, score formula, stable sort, grouping pass |
+| `12_FAILURE_AND_RESILIENCE.md` | Failure isolation and suspension timings |
+| `13_SECURITY_BOUNDARIES.md` | Untrusted data and separation of parity from host hardening |
+| `14_TEST_STRATEGY.md` | Compatibility golden suite and live smoke tests |
+| `15_DEPENDENCIES.md` | Compatibility dependency baseline |
+| `16_IMPLEMENTATION_BLUEPRINT.md` | Concrete package/API/build sequence |
+| `17_OPEN_QUESTIONS.md` | Only external/live questions still needing validation |
 
-## Recommended reading order
+## Reading order for the implementation agent
 
-1. This index.
-2. The target architecture and pipeline.
-3. The provider contract.
-4. The three provider protocol documents.
-5. Transport and deadline behavior.
-6. Result identity, merge, and ranking.
-7. Failure, security, testing, and dependency decisions.
-8. The implementation blueprint.
-9. Open questions before implementation begins.
+1. `00_INDEX.md`
+2. `16_IMPLEMENTATION_BLUEPRINT.md`
+3. `07_HTTP_TRANSPORT.md`
+4. `04`, `05`, `06` provider protocols
+5. `09`, `10`, `11` normalization/dedupe/ranking
+6. `08` concurrency/deadlines
+7. `12` failure/suspension
+8. `03` provider contract
+9. `14` tests
+10. `13`, `15`, `17`
 
-## ESSENTIAL_V1 checklist
+## Compatibility-critical facts that must not be simplified away
 
-- [ ] Accept a non-empty query and a bounded result limit.
-- [ ] Execute Google, Bing, and DuckDuckGo with independent provider adapters.
-- [ ] Use one monotonic total deadline for the search operation.
-- [ ] Start eligible provider requests concurrently.
-- [ ] Isolate provider exceptions and preserve successful results.
-- [ ] Support first-page search for all three providers.
-- [ ] Support Google time and safe-search parameters.
-- [ ] Support Bing market/region and safe-search parameters.
-- [ ] Support DuckDuckGo region, first-page HTML POST, and the token needed for safe pagination.
-- [ ] Detect provider block, CAPTCHA, malformed-response, timeout, and transport failures without attempting to defeat challenges.
-- [ ] Normalize title, snippet, destination URL, provider, and 1-based provider position.
-- [ ] Keep provider provenance and all observed positions after a merge.
-- [ ] Use an explicit canonical identity separate from the display URL.
-- [ ] Apply conservative duplicate matching that does not remove meaningful query parameters.
-- [ ] Use a deterministic, unit-testable ranking rule.
-- [ ] Enforce a per-provider parse cap and a final output cap.
-- [ ] Emit structured telemetry without cookies, tokens, or response bodies.
-- [ ] Add sanitized provider fixtures and protocol regression tests.
-- [ ] Keep arbitrary page fetching out of this component.
+- Google safe-search level 0 omits the `safe` parameter rather than sending `safe=off`.
+- Google combines a Nokia HTTP User-Agent with `chrome99_android` transport impersonation.
+- Google wrapper decoding splits `&sa=U` before percent-decoding.
+- Bing does not use its `mkt` helper in ordinary web search.
+- Bing malformed recognized base64 wrappers can fail the provider because decoding is not locally isolated.
+- Primary DuckDuckGo uses a stable User-Agent and a 3600-second query+UA-bound `vqd` cache.
+- Primary DuckDuckGo page 1 and continuation forms differ materially.
+- Search providers share one deadline; a late worker cannot add results.
+- Common normalization happens before identity/merge.
+- Ordinary result identity excludes scheme but includes netloc/path/params/query/fragment/img_src/template.
+- Same-provider duplicates are not pre-collapsed; they can append additional positions.
+- Ranking uses product of engine weights, number of positions, and reciprocal positions.
+- Score sorting is followed by a separate category/template/image grouping pass.
+- Equal-score parity has no explicit canonical tie-break; insertion order can matter.
 
-## Important boundaries
+## V1 checklist
 
-The three services do not expose one uniform protocol:
-
-- Google uses a mobile/legacy public representation that returns an XML-like HTML document and uses a redirect-style result URL.
-- Bing uses a standard HTML result page and may wrap result destinations in a base64url value.
-- DuckDuckGo’s active no-JavaScript flow is a form POST and has a query/User-Agent-bound validation token for later pages.
-
-The adapter layer must retain these differences. The coordinator should know only capabilities, deadlines, typed results, and typed failures.
-
-## Major uncertainties
-
-The largest unresolved issues are intentionally collected in 17_OPEN_QUESTIONS.md:
-
-- Whether each public endpoint remains available from the deployment network.
-- Whether current anti-automation behavior is IP-based, fingerprint-based, or both.
-- Whether an explicit safe-search mapping for DuckDuckGo HTML is still supported.
-- Whether Google’s public mobile representation continues to emit the observed classes.
-- Whether Bing’s redirect wrapper format remains stable.
-- Which locale fallback policy is acceptable for the product.
-- Whether the runtime can use an asynchronous HTTP stack and HTML parser without conflicting dependencies.
+- [ ] One async callable tool-facing search entry point.
+- [ ] Google, Bing, and primary DuckDuckGo adapters.
+- [ ] `curl_cffi`-class browser impersonation behavior.
+- [ ] Generated/verified locale trait snapshot and best-fit mapping.
+- [ ] Shared monotonic deadline and partial failures.
+- [ ] Exact provider request/parse golden fixtures.
+- [ ] Exact common text/URL normalization.
+- [ ] Exact global identity/dedup semantics.
+- [ ] Exact merge and score formula.
+- [ ] Exact final grouping pass.
+- [ ] Primary DuckDuckGo TTL state and continuation support.
+- [ ] Failure/suspension behavior represented accurately.
+- [ ] Final output cap applied only after aggregation/order.
+- [ ] Provider data marked untrusted at the tool boundary.
+- [ ] Search does not fetch arbitrary result destinations.
+- [ ] Optional live smoke suite from deployment egress.
 
 ## Definition of done
 
-The documentation is complete when a separate engineer can implement the subsystem without reopening the analyzed repository, while understanding which statements are observations and which are recommendations. An implementation is complete when it satisfies the ESSENTIAL_V1 checklist, passes the test plan, returns partial results on provider failure, and exposes no untrusted provider text as trusted agent instructions.
+Documentation is implementation-ready when a new coding agent can build the primary tool without reopening the analyzed source repository and can reproduce all parity golden tests.
+
+Implementation is parity-ready when all fixture/request/normalization/dedupe/ranking/deadline tests pass and live smoke tests demonstrate that current provider endpoints still accept the documented protocol from the intended deployment network.
+
+External search services can change independently. A live failure does not automatically mean the implementation is wrong; fixture parity and live protocol health must be diagnosed separately.
