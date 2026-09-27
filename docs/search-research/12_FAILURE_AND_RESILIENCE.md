@@ -1,178 +1,196 @@
 # Failure and resilience
 
-## Failure design goals
+## Compatibility target
 
-The search tool is a best-effort aggregation operation. One provider’s failure must not erase successful results from another provider. Failures must be typed, bounded, observable, and safe to expose at the tool boundary.
+Provider failures are isolated: one provider can fail, time out, be blocked, or be suspended without invalidating successful sibling providers. The compatibility layer should preserve the observed classifications and suspension semantics before the host converts them into its own tool diagnostics.
 
-## Typed failure model
+## Common online-provider exception handling
 
-    ProviderFailure
-      provider
-      kind
-      phase
-      retryable
-      elapsed_ms
-      status_code: optional
-      content_type: optional
-      diagnostic_code
-      cooldown_until: optional
+The online provider processor handles these broad groups:
 
-Kinds:
+1. TLS/SSL errors;
+2. transport timeout / async timeout;
+3. other request exceptions;
+4. provider CAPTCHA, too-many-requests, and access-denied exceptions;
+5. any other exception.
 
-- Timeout
-- ConnectionFailure
-- Blocked
-- CaptchaDetected
-- InvalidResponse
-- ParseFailure
-- UnsupportedLocale
-- RateLimited
-- ProviderUnavailable
+Transport-related failures and explicit access-denied/CAPTCHA/rate-limit failures request provider suspension. Generic unexpected parser exceptions are recorded but do not use the same `suspend=True` path.
 
-The diagnostic code should be stable and low-cardinality. For example, google_sorry_redirect is safer than embedding a URL or response excerpt.
+No provider exception is supposed to terminate sibling searches.
 
-## Failure handling matrix
+## Generic HTTP classification
 
-| Failure | Detection | Retry | Continue search? | Observability | Expose to AI agent? |
-| --- | --- | --- | --- | --- | --- |
-| Timeout | Remaining deadline reaches zero, connect/read timeout | No after deadline; at most one early transient retry | Yes | timeout count, elapsed, phase | Safe summary only |
-| ConnectionFailure | DNS, connect, TLS, socket, proxy failure | One retry only for clearly transient connect failure | Yes | error class, host, retry count | Usually summarize degraded provider |
-| Blocked | 403/access-denied page, explicit provider block marker | No tight retry; cooldown | Yes | blocked flag, status | Optional safe provider status |
-| CaptchaDetected | Google sorry path, challenge form, known challenge body | No solver; cooldown | Yes | captcha flag, detection code | Safe “provider unavailable” summary |
-| InvalidResponse | Bad status, unsupported encoding, size limit | Usually no; status-specific policy | Yes | status/content type/bytes | Usually no raw detail |
-| ParseFailure | Expected result structure missing or malformed | No same-response retry | Yes | fixture/regression counter | Safe degraded summary |
-| UnsupportedLocale | No safe provider mapping | No | Yes, if fallback is safe | locale and fallback label | Only if user requested strict locale |
-| RateLimited | 429 or provider throttle marker | Backoff later, not in same tight search | Yes | status, retry-after if safe | Safe degraded summary |
-| ProviderUnavailable | Disabled, suspended, not initialized | Wait for cooldown or reinitialize | Yes | availability state | Optional |
+Before provider-specific parsing, the common HTTP error layer recognizes:
 
-## HTTP status interpretation
+- provider-independent Cloudflare challenge patterns;
+- Cloudflare firewall/access-denied patterns;
+- a reCAPTCHA pattern;
+- HTTP 402/403 as access denied;
+- HTTP 429 as too many requests;
+- other failing statuses through the underlying HTTP client's status exception.
 
-Generic handling should distinguish:
+Provider parsers can add stronger signatures, for example:
 
-- 2xx with valid result structure: success;
-- 2xx with challenge or login structure: Blocked or CaptchaDetected;
-- 3xx: provider-specific; Google’s observed 302 is challenge-like, while DuckDuckGo’s observed 303 returns empty;
-- 401/403: access denied or blocked;
-- 402: access denied in the observed generic mapping;
-- 429: RateLimited;
-- 5xx: InvalidResponse or transient transport failure, depending on body and retry policy;
-- all other 4xx: InvalidResponse unless a provider-specific mapping exists.
+- Google: host/path `/sorry`, any 302, or short `/sorry/` body;
+- primary DuckDuckGo: `form#challenge-form`;
+- primary DuckDuckGo missing continuation `vqd`: explicit CAPTCHA-class exception with zero suspension.
 
-Do not use status alone when the provider has a stronger body signature.
+Bing's ordinary web parser has no independent challenge selector in the audited path.
 
-## Provider suspension and cooldown
+## Suspension state
 
-**Observation:** Provider state tracks continuous failures, a suspension end time, a reason, and a lock. The analyzed policy applies short increasing failure bans, with category-specific longer durations for CAPTCHA, access denial, and repeated throttling. Success resumes a suspended provider.
+Each provider processor owns/reuses a thread-safe suspended-status object keyed according to its network identity. It stores:
 
-**Recommendation:** Implement a small circuit breaker:
+    continuous_errors
+    suspend_end_time
+    suspend_reason
 
-1. On a transient connection failure, increment a failure counter.
-2. On a block/CAPTCHA/rate limit, open the provider circuit immediately for a category-specific cooldown.
-3. On generic parse failure, record the event but do not necessarily suspend after one occurrence.
-4. Use bounded exponential backoff with jitter for repeated failures.
-5. On a successful, structurally valid response, reset the consecutive-failure count.
-6. Never let a suspended provider delay other providers.
+### Generic suspension duration
 
-Illustrative starting values:
+When suspension is requested without an explicit access-denied duration, the current active configuration uses:
 
-| Failure class | Initial cooldown | Growth/cap |
-| --- | ---: | --- |
-| Transient connection | 5 s | exponential, cap 120 s |
-| Rate limit | 30 s | provider Retry-After if safe, cap 15 min |
-| CAPTCHA/block | 1 h | longer after repeats |
-| Parse drift | no automatic suspension on first event | operator review after threshold |
+    ban_time_on_fail = 5 seconds
+    max_ban_time_on_fail = 120 seconds
 
-These are recommendations; tune from deployment telemetry.
+The current implementation chooses `min(max_ban_time_on_fail, ban_time_on_fail)`, so the immediate generic duration is 5 seconds. Although a continuous-error counter is incremented, this specific method does not itself implement exponential growth.
 
-## Parsing failures
+**PARITY MUST:** do not describe the current generic failure suspension as exponential backoff.
 
-Parser behavior should be tiered:
+### Active configured access/challenge durations
 
-### Item-level failure
+The audited runtime configuration overrides schema defaults with:
 
-Examples:
+| Failure | Active duration |
+| --- | ---: |
+| Access denied / HTTP 402-403 | 180 s |
+| CAPTCHA | 3600 s |
+| Too many requests / HTTP 429 | 180 s |
+| Cloudflare CAPTCHA | 1,296,000 s |
+| Cloudflare firewall/access denied | 86,400 s |
+| reCAPTCHA | 604,800 s |
 
-- missing title;
-- one malformed href;
-- one invalid encoded redirect;
-- one oversized snippet.
+These are configuration values, not universal protocol constants. Compatibility fixtures should distinguish code behavior from deployment policy.
 
-Skip the item, increment a warning counter, and continue parsing the other blocks.
+The settings schema's fallback defaults differ for several classes (for example generic access denied/CAPTCHA/too-many), so an implementation that wants this audited deployment behavior should use the active values above or make them explicit configuration.
 
-### Document-level failure
+## Explicit zero-suspension DuckDuckGo cases
 
-Examples:
+Primary DuckDuckGo deliberately raises its CAPTCHA/access-denied class with:
 
-- no expected result container and no valid empty-result marker;
-- response is a challenge/login page;
-- invalid encoding prevents safe parsing;
-- result container exists but every item is structurally unusable.
+    suspended_time = 0
 
-Return ParseFailure, Blocked, or CaptchaDetected as appropriate.
+when:
 
-### Transport-level failure
+- a continuation page is requested without a cached `vqd`;
+- an HTML response contains `challenge-form`.
 
-Examples:
+That exception still records a provider failure, but its explicit duration overrides the normal CAPTCHA suspension period.
 
-- DNS or connection failure;
-- TLS verification failure;
-- read timeout;
-- decompressed-size limit;
-- cancellation.
+**PARITY MUST:** do not replace these zero-duration cases with the global one-hour CAPTCHA cooldown.
 
-Return the corresponding typed transport failure and discard the response.
+## Success recovery
 
-## Retry safety
+When a provider successfully finishes and its result set is accepted before timeout, the processor resumes that provider:
 
-A retry is allowed only when:
+    continuous_errors = 0
+    suspend_end_time = 0
+    suspend_reason = ""
 
-- the provider request is idempotent or the provider’s form POST is known to be safe to repeat;
-- remaining time is sufficient;
-- the failure is classified transient;
-- the retry count is within a hard limit;
-- the provider is not blocked or challenged.
+A late worker marked timed out does not insert its results and therefore does not follow the normal accepted-success path.
 
-Do not retry malformed parser output or CAPTCHA pages. Do not retry a tokenless DuckDuckGo continuation request.
+## Suspended-provider selection
 
-## Partial and all-provider failure
+Before starting a search worker, the orchestrator checks provider suspension state. A currently suspended provider is not started; it is instead recorded as an unresponsive/suspended engine for that search.
 
-If one provider succeeds, return its results and mark the response degraded if another provider failed. If no provider succeeds:
+This makes suspension a pre-dispatch capability/health gate rather than a delay inside the search call.
 
-    results = []
-    degraded = true
-    providers = typed diagnostics
+## Provider-specific failure behavior
 
-The public tool should distinguish “no results from a healthy provider” from “all providers failed”, even if both result lists are empty.
+### Google
 
-## Safe diagnostics
+Provider parser raises its CAPTCHA/access-denied type for:
 
-Good diagnostic fields:
+- response host `sorry.google.com`;
+- response path beginning `/sorry`;
+- any HTTP 302 reaching the parser;
+- body shorter than 2,000 chars containing `/sorry/`.
 
-    provider
-    phase
-    kind
-    status_code
-    elapsed_ms
-    retryable
-    cooldown_active
+Individual malformed result blocks are caught and skipped, so one bad Google item normally does not fail the whole provider.
 
-Do not include:
+### Bing
 
-- cookies;
-- validation tokens;
-- full query URLs;
-- full HTML;
-- arbitrary exception strings containing URLs or credentials;
-- provider snippets in error labels.
+Missing result link/title is skipped. However malformed base64 inside a recognized `u=a1...` wrapper is not locally caught. That exception can leave the parser and is then handled as a generic provider exception by the online processor.
 
-## Recovery
+A successful HTML response with zero matching result blocks returns an empty list rather than an explicit parse failure.
 
-Recovery actions belong outside the immediate search call:
+### Primary DuckDuckGo
 
-- cooldown expiry;
-- background trait refresh;
-- circuit reset after a valid smoke test;
-- dependency/client recreation after repeated connection failure;
-- operator alert after parser regression threshold.
+- query length >= 500 produces no URL/request;
+- 303 returns empty results;
+- missing continuation token raises zero-duration CAPTCHA/access-denied;
+- Chinese continuation can produce no URL/request;
+- `challenge-form` raises zero-duration CAPTCHA/access-denied;
+- structural exceptions during indexed result extraction can escape and become generic provider failures.
 
-The search call itself should remain bounded and should not wait for recovery.
+### Secondary DuckDuckGo JSON/script adapter
+
+- missing preload URL means no request URL;
+- JSON/parser failures can escape to common provider handling;
+- its narrow arithmetic challenge path can perform one provider-specific follow-up request.
+
+## Timeout versus transport failure
+
+The search orchestrator can mark a worker timed out because the common search deadline elapsed even if the underlying network thread is still alive. Separately, the network/client can raise a timeout during provider execution.
+
+Both prevent successful result insertion for that provider, but they arise at different layers. The host diagnostics may unify them as `Timeout` while retaining a low-cardinality phase field.
+
+## Empty result versus failure
+
+Compatibility requires preserving these distinctions:
+
+- healthy provider returns zero matching results -> success with empty result list;
+- provider request builder sets URL to none due to a known unsupported state -> provider does no network call and contributes no results;
+- exception -> provider error/unresponsive diagnostic;
+- suspended provider -> no worker launched;
+- timed-out provider -> late results ignored.
+
+Do not convert every empty list into `ParseFailure`.
+
+## Host-facing typed diagnostics
+
+Overmind can project internal conditions into a simpler enum such as:
+
+    Timeout
+    ConnectionFailure
+    AccessDenied
+    CaptchaDetected
+    RateLimited
+    ParserFailure
+    Suspended
+    UnsupportedCapability
+
+This projection is useful, but it must not alter provider behavior. Preserve an internal reason/code sufficient to test source parity.
+
+## Retry interaction
+
+Configured generic network retries are zero in the audited defaults. One disconnected pooled connection may still be recreated and retried once without consuming that retry budget. Challenge/access-denied/rate-limit paths should not be wrapped in a new aggressive retry loop by the tool.
+
+## Golden tests
+
+Test:
+
+- one provider failure preserves sibling results;
+- suspended provider is skipped before worker launch;
+- successful accepted result resets suspension state;
+- generic transport failure uses active 5-second generic suspension when no explicit duration exists;
+- active 180/3600/180-second configured access/CAPTCHA/rate-limit values;
+- Cloudflare/reCAPTCHA configured durations;
+- primary DuckDuckGo missing-vqd/challenge uses explicit zero suspension;
+- Google malformed item is skipped locally;
+- malformed Bing wrapper can escalate to provider failure;
+- HTTP-200 zero-result page remains distinguishable from provider failure;
+- late timed-out worker cannot recover by inserting results afterward.
+
+## Deliberate deviations
+
+Exponential circuit breakers, jitter, adaptive health scores, or long parser-regression cooldowns can be added by the host later. They are operational enhancements, not the audited failure policy, and should be disabled in compatibility tests.
