@@ -1,19 +1,24 @@
 # Independent implementation blueprint
 
+## Objective
+
+Build a small self-contained Python search package for an existing AI runtime. The package must reproduce the audited behavior of three web providers—Google, Bing, and the primary DuckDuckGo HTML path—then expose the merged/ranked results through one tool call.
+
+The package is independent in naming and structure, but its provider request, parsing, normalization, deduplication, merge, ranking, deadline, and failure semantics are compatibility requirements.
+
 ## Proposed package shape
 
-The following shape is a recommendation for a small self-contained package. It is intentionally functional and does not mirror any other application’s layout.
-
-    web_search/
+    search/
         __init__.py
         models.py
         coordinator.py
         transport.py
-        locales.py
-        urls.py
-        ranking.py
-        errors.py
+        traits.py
         state.py
+        normalize.py
+        identity.py
+        aggregate.py
+        errors.py
         telemetry.py
         providers/
             __init__.py
@@ -21,599 +26,379 @@ The following shape is a recommendation for a small self-contained package. It i
             google.py
             bing.py
             duckduckgo.py
+            # optional later:
+            duckduckgo_json.py
 
-The package can be renamed to match the host project. The responsibilities and boundaries are the important part.
+Names are generic and project-owned. Do not mirror a larger application's internal module/class hierarchy.
 
-## Public API
+## Public tool API
 
-Conceptual entry point:
+Conceptual API:
 
     async search(
         query: str,
         *,
         limit: int = 10,
-        language: str | None = None,
-        region: str | None = None,
-        safe_search: SafeSearch = SafeSearch.MODERATE,
-        time_range: TimeRange | None = None,
+        locale: str = "all",
+        safe_search: int = 0,
+        time_range: str | None = None,
         page: int = 1,
-        providers: Sequence[str] | None = None,
-        timeout: float = 4.0,
+        timeout: float | None = None,
     ) -> SearchResponse
 
-The exact enum syntax may change with the host project. The API must make filters explicit and must not expose raw provider parameter dictionaries.
+Suggested accepted values:
 
-## Type-level pseudocode
+    safe_search: 0 | 1 | 2
+    time_range: None | "day" | "week" | "month" | "year"
+    page: one-based
 
-    enum SafeSearch:
-        OFF
-        MODERATE
-        STRICT
+The public API should not expose raw provider query parameters or cookies.
 
-    enum TimeRange:
-        DAY
-        WEEK
-        MONTH
-        YEAR
+## Compatibility mode is the default implementation target
 
-    SearchRequest:
-        query
-        limit
-        language
-        region
-        safe_search
-        time_range
-        page
-        providers
-        timeout
+The first implementation should have one behavior mode only: compatibility. Avoid shipping a parallel “improved” ranking/URL-normalization path until the parity suite passes.
 
-    ProviderCapabilities:
-        supports_paging
-        max_page
-        supports_time_range
-        supports_language
-        supports_region
-        supports_safe_search
+Host hardening can exist at explicit boundaries, for example:
 
-    ProviderRequest:
-        provider
-        method
-        url
-        query
-        form
-        headers
-        cookies
-        follow_redirects
-        browser_profile
-        deadline
+    provider parity pipeline
+       -> agent-output URL policy
+       -> tool serialization
 
-    ProviderResult:
-        provider
-        title
-        url
-        snippet
-        position
-        published_at
-        thumbnail
-        metadata
+Do not mix those concerns inside provider parsers or ranking.
 
-    ProviderOutcome:
-        provider
-        results
-        failure
-        diagnostics
+## Internal models
 
-    ResultObservation:
-        provider
-        position
-        url
-        title
-        snippet
+### SearchRequest
 
-    SearchResult:
-        title
-        url
-        snippet
-        providers
-        observations
-        score
-        published_at
-        thumbnail
-        metadata
+    query
+    limit
+    locale
+    safe_search
+    time_range
+    page
+    timeout_limit
 
-    SearchResponse:
-        query
-        results
-        providers
-        degraded
-        elapsed_ms
+### PreparedRequest
+
+    provider
+    method
+    url
+    headers
+    cookies
+    form/data
+    json/content
+    allow_redirects
+    browser_profile
+    default_headers
+    network flags
+
+### ProviderMainResult
+
+Use fields sufficient to reproduce common normalization/identity:
+
+    url
+    parsed_url
+    title
+    content
+    thumbnail
+    img_src
+    provider/engine
+    template
+    priority
+
+### AggregatedResult
+
+    url
+    parsed_url
+    title
+    content
+    thumbnail
+    img_src
+    primary_provider
+    providers: set
+    positions: list[int]
+    template
+    category
+    priority
+    score
+
+Optionally retain an auxiliary labelled observation list for telemetry/explainability, but do not replace the compatibility `positions` list used by scoring.
+
+### SearchResponse
+
+Agent-facing projection:
+
+    query
+    results
+    provider_diagnostics
+    elapsed_ms
+
+Each result may expose:
+
+    title
+    url
+    snippet
+    score
+    providers
+    positions
+    thumbnail
+
+All provider text remains untrusted data.
 
 ## Module responsibilities
 
-### models.py
+### `providers/google.py`
 
-Responsibility:
+Must own:
 
-- public request/response types;
-- provider result and observation types;
-- safe-search and time-range enums;
-- serialization-safe field bounds.
+- WML endpoint;
+- locale query mappings;
+- exact safe/time/page parameter conditions;
+- fixed Nokia User-Agent set;
+- `chrome99_android` profile;
+- Google-sorry detection;
+- XML-declaration removal;
+- exact XPath extraction;
+- exact `/url?q=` split-before-unquote decoder;
+- per-result exception isolation.
 
-Public API:
+Must not own global dedupe/ranking.
 
-- SearchRequest;
-- SearchResponse;
-- SearchResult;
-- ProviderDiagnostic;
-- enum values.
+### `providers/bing.py`
 
-Dependencies:
+Must own:
 
-- standard typing/dataclasses or the host’s existing model system.
+- `/search` endpoint;
+- `q/adlt/setlang/cc` mapping;
+- no `mkt` for the ordinary web path;
+- exact result selectors;
+- decorative icon removal;
+- exact `ck/a?u=a1...` decoder;
+- the fact that malformed recognized base64 can fail the provider;
+- HTTP/3 provider transport flag.
 
-Must not know:
+Must not invent pagination/time support.
 
-- HTML selectors;
-- transport client classes;
-- provider cookies;
-- ranking internals.
+### `providers/duckduckgo.py`
 
-Tests:
+Must own:
 
-- validation;
-- serialization;
-- bounds;
-- enum mapping.
+- query-length guard;
+- external-bang quoting/whitespace behavior;
+- stable generated User-Agent;
+- HTML POST endpoint;
+- exact Sec-Fetch/Referer/content-type headers;
+- `kl` region form/cookie behavior;
+- `df` time form/cookie behavior;
+- first-page `b` field;
+- continuation `vqd/nextParams/api/o/v/s/dc` fields;
+- `vqd` state keyed by transformed query + UA, TTL 3600;
+- Chinese continuation suppression;
+- 303 empty behavior;
+- `challenge-form` CAPTCHA behavior with zero suspension;
+- exact result and zero-click selectors.
 
-### errors.py
+Do not add an unverified safe-search field.
 
-Responsibility:
+### optional `providers/duckduckgo_json.py`
 
-- typed provider failures;
-- retryability and phase;
-- safe diagnostic codes.
+Only after primary V1 parity passes. It may implement the separately documented preload-link/JSON path, including Firefox profile, page URL cache, sequential pagination, and narrow arithmetic challenge behavior.
 
-Public API:
+### `transport.py`
 
-- ProviderFailure;
-- FailureKind;
-- SearchInputError;
-- UnsupportedCapability.
+Compatibility baseline: `curl_cffi` async clients.
 
-Dependencies:
+Must support:
 
-- standard exceptions and enums.
+- provider-specific impersonation;
+- explicit default-header enable/disable;
+- HTTP/2 and conditional HTTP/3;
+- TLS verification;
+- pooled clients keyed by material transport settings;
+- explicit cookies with no accidental jar carryover;
+- redirects disabled for ordinary provider calls;
+- common HTTP error classification;
+- one shared remaining-time budget.
 
-Must not know:
+### `traits.py`
 
-- raw response bodies;
-- provider parser structure.
+Must provide equivalent Google/Bing/DDG provider mappings from a generated snapshot and best-fit locale logic. Broad locale support requires more than splitting BCP-47 strings.
 
-Tests:
+Trait refresh is optional tooling, not a per-query dependency.
 
-- classification;
-- redaction;
-- stable diagnostic serialization.
+### `state.py`
 
-### transport.py
+Must provide provider-scoped TTL state with safe concurrent access.
 
-Responsibility:
+For primary DDG:
 
-- one async client/pool;
-- GET/POST with query/form fields;
-- bounded body reading;
-- TLS, compression, redirects, retries;
-- deadline propagation.
-
-Public API:
-
-- SearchTransport;
-- TransportResponse;
-- request method accepting ProviderRequest.
-
-Dependencies:
-
-- one selected async HTTP library.
-
-Must not know:
-
-- result classes;
-- provider challenge signatures;
-- URL identity or ranking.
-
-Tests:
-
-- fake server request shape;
-- body limits;
-- retry/deadline;
-- cancellation;
-- connection reuse;
-- close behavior.
-
-### locales.py
-
-Responsibility:
-
-- parse caller locale;
-- map it separately for Google, Bing, and DuckDuckGo;
-- provide all-locale fallback;
-- expose unsupported/fallback diagnostics.
-
-Public API:
-
-- ParsedLocale;
-- map_google_locale;
-- map_bing_locale;
-- map_duckduckgo_locale.
-
-Dependencies:
-
-- standard parser or optional locale library;
-- static provider trait data.
-
-Must not know:
-
-- HTTP client;
-- HTML parser.
-
-Tests:
-
-- common locales;
-- script tags;
-- country aliases;
-- fallback behavior.
-
-### urls.py
-
-Responsibility:
-
-- provider wrapper decoding;
-- absolute URL validation;
-- display URL normalization;
-- canonical identity construction.
-
-Public API:
-
-- unwrap_provider_url;
-- validate_result_url;
-- canonical_identity;
-- choose_display_url.
-
-Dependencies:
-
-- urllib.parse;
-- optional IDNA support from the standard library.
-
-Must not know:
-
-- ranking;
-- provider HTML selectors;
-- network access.
-
-Tests:
-
-- every wrapper example;
-- conservative identity table;
-- malformed/hostile URLs;
-- collision-safe lookup.
-
-### state.py
-
-Responsibility:
-
-- provider-scoped TTL state;
-- DuckDuckGo token keying by query/User-Agent;
-- cooldown/circuit state;
-- concurrency protection.
-
-Public API:
-
-- TokenStore;
-- ProviderCircuit;
-- StateSnapshot.
-
-Dependencies:
-
-- standard dict, hashlib, time, asyncio lock.
-
-Must not know:
-
-- HTML structure;
-- how a token is extracted;
-- result ranking.
-
-Tests:
-
-- TTL;
-- key isolation;
-- concurrent reads/writes;
-- invalidation;
-- cooldown transitions.
-
-### providers/base.py
-
-Responsibility:
-
-- common adapter protocol;
-- capability description;
-- provider outcome interface.
-
-Public API:
-
-- SearchProvider protocol;
-- ProviderCapabilities;
-- ProviderContext.
-
-Dependencies:
-
-- models, errors, transport abstractions.
-
-Must not know:
-
-- any provider selector or cookie name.
-
-Tests:
-
-- fake adapter contract;
-- unsupported capability handling.
-
-### providers/google.py
-
-Responsibility:
-
-- Google endpoint and query construction;
-- mobile User-Agent/profile policy;
-- locale, safe-search, time, and page mapping;
-- sorry/CAPTCHA detection;
-- HTML/XML-like parser;
-- /url?q= decoding.
-
-Dependencies:
-
-- base contract;
-- locale mapper;
-- HTML parser;
-- URL decoder;
-- transport.
-
-Must not know:
-
-- Bing or DuckDuckGo state;
-- global ranking;
-- coordinator task management.
-
-Tests:
-
-- all Google cases in 14_TEST_STRATEGY.md.
-
-### providers/bing.py
-
-Responsibility:
-
-- Bing endpoint and q/adlt construction;
-- setlang/cc market mapping;
-- HTML parser;
-- ck/a base64url decoding;
-- block/invalid-wrapper classification.
-
-Dependencies:
-
-- base contract;
-- locale mapper;
-- HTML parser;
-- URL decoder;
-- transport.
-
-Must not know:
-
-- other provider cookies or tokens;
-- global ranking.
-
-Tests:
-
-- request mappings, fixtures, wrapper decoding, malformed inputs.
-
-### providers/duckduckgo.py
-
-Responsibility:
-
-- HTML POST first-page request;
-- kl/df cookie fields;
-- stable User-Agent;
-- token extraction and later-page request;
-- TTL state lookup/invalidation;
-- challenge-form detection;
-- web-result parsing.
-
-Dependencies:
-
-- base contract;
-- locale mapper;
-- state store;
-- HTML parser;
-- transport.
-
-Must not know:
-
-- global merge/rank policy;
-- CAPTCHA-solving behavior;
-- arbitrary page fetching.
-
-Tests:
-
-- first page, later pages, cache isolation, challenge, query limit, fixtures.
-
-### coordinator.py
-
-Responsibility:
-
-- validate request;
-- establish total deadline;
-- prepare provider requests;
-- run provider tasks;
-- collect partial outcomes;
-- normalize and merge;
-- invoke ranking;
-- enforce final limit.
-
-Public API:
-
-- SearchCoordinator.search;
-- top-level search function.
-
-Dependencies:
-
-- models, errors, provider registry, transport, URL policy, ranker, telemetry.
-
-Must not know:
-
-- provider selectors;
-- provider-specific form fields;
-- how redirects are decoded.
-
-Tests:
-
-- all concurrency and partial-failure cases;
-- deterministic completion-order independence.
-
-### ranking.py
-
-Responsibility:
-
-- provider-local duplicate collapse;
-- provenance-aware merge;
-- score calculation;
-- deterministic sort and final cap.
-
-Public API:
-
-- merge_results;
-- rank_results;
-- score_result.
-
-Dependencies:
-
-- models;
-- URL identity policy.
-
-Must not know:
-
-- network or HTML.
-
-Tests:
-
-- observed compatibility score;
-- recommended V1 score;
-- tie-breaking and consensus cap.
-
-### telemetry.py
-
-Responsibility:
-
-- structured provider metrics;
-- redaction and low-cardinality labels.
-
-Public API:
-
-- ProviderMetrics;
-- record_provider_outcome.
-
-Dependencies:
-
-- host logger/metrics interface.
-
-Must not know:
-
-- raw body details;
-- ranking internals except counts.
-
-Tests:
-
-- redaction;
-- field bounds;
-- no token/cookie leakage.
-
-## Full call sequence
-
-    caller
-      |
-      v
-    web_search.search(...)
-      |
-      v
-    validate SearchRequest
-      |
-      v
-    start = monotonic()
-    deadline = start + timeout
-      |
-      v
-    for each enabled provider:
-        capabilities()
-        locale mapping
-        prepare ProviderRequest
-      |
-      v
-    create one async task per eligible provider
-      |
-      +--> Google:
-      |      GET mobile endpoint
-      |      inspect block status
-      |      parse blocks
-      |      unwrap destination
-      |
-      +--> Bing:
-      |      GET standard endpoint
-      |      inspect block status
-      |      parse b_algo blocks
-      |      decode ck/a destination
-      |
-      +--> DuckDuckGo:
-             POST HTML form
-             inspect challenge-form
-             extract/cache vqd
-             parse web-result blocks
-      |
-      v
-    collect ProviderOutcome values until deadline
-      |
-      v
-    normalize text and URLs
-      |
-      v
-    collapse provider-local duplicates
-      |
-      v
-    merge cross-provider identities
-      |
-      v
-    calculate recommended score
-      |
-      v
-    deterministic sort and final limit
-      |
-      v
-    SearchResponse
-
-## V1 construction order
-
-1. Implement models and errors.
-2. Implement URL validation and identity with tests.
-3. Implement fake transport and coordinator deadline tests.
-4. Implement Google request/parser with fixtures.
-5. Implement Bing request/parser with fixtures.
-6. Implement DuckDuckGo first-page HTML path.
-7. Add token state and later pages behind a capability flag.
-8. Add merge/rank and provenance.
-9. Add telemetry and redaction tests.
-10. Run optional live smoke tests from a controlled environment.
-
-## Non-goals for the implementation agent
-
-- Do not create a server.
-- Do not create a web interface.
-- Do not implement a browser.
-- Do not implement a CAPTCHA solver.
-- Do not fetch result pages.
-- Do not add unrelated providers before the three fixed adapters are tested.
-- Do not copy source structure or source code from any analyzed project.
+    secret/query-UA key -> vqd, 3600 s
+
+If persistence is omitted in favor of process memory, record that as an explicit implementation deviation.
+
+### `normalize.py`
+
+Must reproduce:
+
+- exact whitespace collapse;
+- title/content limits 200/1200;
+- word-boundary ellipsis;
+- content==title clearing;
+- parsed URL construction;
+- missing-scheme `http` behavior;
+- observed IDNA conversion.
+
+### `identity.py`
+
+Must reproduce ordinary identity fields:
+
+    template
+    netloc
+    path
+    params
+    query
+    fragment
+    img_src
+
+Scheme is excluded.
+
+A structured tuple/string can replace a raw Python integer hash for collision safety only if documented as an internal deviation that produces identical ordinary-case equivalence.
+
+### `aggregate.py`
+
+Must reproduce:
+
+- provider-local accepted position assignment;
+- global duplicate merge (including same-provider duplicates);
+- longer title/content selection;
+- provenance union;
+- secure-suffixed scheme preference;
+- exact score formula;
+- score-descending stable sort;
+- exact second grouping pass with `max_count=8`, `max_distance=20`.
+
+Do not pre-collapse same-provider duplicates.
+
+### `coordinator.py`
+
+Must:
+
+1. record search start;
+2. resolve eligible providers;
+3. skip suspended/unsupported providers;
+4. derive one shared timeout;
+5. start all eligible providers concurrently;
+6. accept only results completed before the deadline;
+7. isolate provider failures;
+8. normalize/merge in accepted provider completion order for parity-sensitive ties;
+9. close/score/order;
+10. apply the final caller result limit;
+11. project results through any explicit host output policy.
+
+A native asyncio coordinator is preferred; it need not reproduce source worker threads internally.
+
+## Provider capability matrix
+
+| Capability | Google | Bing | Primary DuckDuckGo |
+| --- | --- | --- | --- |
+| First page | yes | yes | yes |
+| Later pages | yes, max 50 | no | yes with cached state |
+| Time filter | yes | no | yes |
+| Safe capability | yes | yes | advertised, no explicit request mapping in audited HTML builder |
+| Locale | language + region traits | region traits | region traits + Accept-Language |
+| JS runtime | no | no | no |
+
+The coordinator should mimic the common capability gate: when a global requested option is unsupported, that provider is skipped rather than receiving invented parameters.
+
+## End-to-end call sequence
+
+    ToolRegistry / authorized search call
+        |
+        v
+    SearchRequest validation
+        |
+        v
+    search_start + actual_timeout
+        |
+        v
+    capability / suspension filter
+        |
+        v
+    launch eligible provider tasks concurrently
+        |
+        +--> Google request -> parse
+        +--> Bing request -> parse
+        +--> DDG HTML request -> parse/state update
+        |
+        v
+    accept only in-deadline provider outputs
+        |
+        v
+    common normalization
+        |
+        v
+    global identity merge in insertion order
+        |
+        v
+    score on close
+        |
+        v
+    score sort + category/template/image grouping
+        |
+        v
+    final result limit
+        |
+        v
+    host output URL/security policy
+        |
+        v
+    bounded SearchResponse -> agent
+
+## Recommended construction order
+
+1. models + parity fixtures;
+2. curl transport and deadline tests;
+3. common text/URL normalization;
+4. identity + merge + exact rank/grouping;
+5. trait snapshot/best-fit mapping;
+6. Google adapter;
+7. Bing adapter;
+8. primary DDG first-page adapter;
+9. DDG token state + continuation;
+10. coordinator/partial failures/suspension;
+11. agent-facing serialization and host policy;
+12. optional live smoke tests;
+13. optional secondary DDG adapter.
+
+This order lets the core aggregation semantics be validated independently from volatile live provider HTML.
+
+## Definition of implementation parity
+
+The implementation is not considered ready merely because all three providers return links. It must pass golden tests for:
+
+- exact provider request parameters and fingerprints;
+- exact parser selectors/error granularity;
+- common normalization;
+- URL identity;
+- duplicate merge;
+- same-provider duplicate behavior;
+- exact score formula;
+- final grouping pass;
+- shared deadline/late-result rejection;
+- suspension behavior;
+- trait mapping for tested locales.
+
+## Non-goals
+
+Do not add in V1:
+
+- a server/UI;
+- arbitrary page fetching;
+- a search index;
+- generic crawling;
+- browser automation;
+- a general JavaScript runtime;
+- provider auto-discovery;
+- alternative ranking hidden behind the default path.
+
+The implementation should be small, embedded, and testable while preserving the mechanics that make the audited providers work.
