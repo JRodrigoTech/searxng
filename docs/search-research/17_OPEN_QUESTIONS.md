@@ -1,191 +1,159 @@
-# Open questions and validation plan
+# Open questions and live validation plan
 
 ## Purpose
 
-These questions are intentionally not hidden behind confident prose. The public web is mutable, and several protocol details are brittle. Each question has a suggested validation method and a safe fallback.
+The implementation mechanics are now specified by compatibility behavior. The remaining unknowns are primarily external: public search endpoints, markup, challenge behavior, transport acceptance, and provider-maintained locale resources can change without our code changing.
 
-## Highest priority live checks
+These questions must not be used as an excuse to redesign documented behavior before the parity suite is implemented.
 
-### 1. Are all three endpoints reachable from deployment?
+## 1. Google endpoint health
 
-Question:
+Validate from the intended deployment egress:
 
-- Can the deployment network reach the Google mobile endpoint, Bing HTML endpoint, and DuckDuckGo HTML endpoint without a login or challenge?
+- `https://www.google.com/wml/search` remains reachable;
+- Nokia User-Agent + `chrome99_android` still returns expected result markup;
+- the current result classes remain present;
+- redirect-disabled 302 and `/sorry` signals still correspond to block/challenge behavior;
+- locale parameters continue to produce expected language/region behavior.
 
-Validation:
+If not, preserve old fixtures and investigate protocol drift before changing the adapter.
 
-- run one low-rate smoke query per provider from the actual deployment egress;
-- record status, body size, content type, and whether the expected result container exists.
+## 2. Bing HTML health
 
-Fallback:
+Validate:
 
-- disable the failing provider through configuration;
-- preserve other provider results;
-- do not add challenge-solving code.
+- `/search` still returns `b_results/b_algo` structure;
+- `ck/a?u=a1...` remains the common wrapper format where used;
+- `setlang/cc` behavior remains effective;
+- the `us/cn/ru` cc exclusions remain desirable;
+- HTTP/3 is accepted/beneficial from intended egress;
+- healthy zero-result pages can still be distinguished operationally from block pages through status/telemetry.
 
-### 2. Does the current Google representation still emit the observed structure?
+Do not invent page/time support merely because Bing's website supports it interactively.
 
-Question:
+## 3. Primary DuckDuckGo HTML health
 
-- Are the result-block, title, snippet, and thumbnail class structures still present?
+Validate:
 
-Validation:
+- `html.duckduckgo.com/html/` accepts the documented form/headers;
+- a stable generated User-Agent remains compatible with continuation `vqd`;
+- hidden `vqd` is still emitted when continuation is available;
+- 3600-second token reuse remains accepted;
+- `kl` form/cookie region behavior remains valid;
+- `df` form/cookie time behavior remains valid;
+- continuation offsets remain 10 then +15;
+- `challenge-form` remains the challenge marker;
+- Chinese continuation restriction is still necessary;
+- 303 remains a meaningful empty outcome.
 
-- capture a small sanitized response fragment;
-- run the parser fixture;
-- compare result count and wrapper links.
+If continuation becomes unreliable, first-page-only operation is a safe capability reduction; do not send tokenless continuation requests.
 
-Fallback:
+## 4. DuckDuckGo safe-search semantics
 
-- return ParseFailure and suspend only after a configurable regression threshold;
-- investigate a new representation separately.
+The primary HTML adapter advertises safe-search capability but does not add a safe-search request value from the numeric setting in the audited builder.
 
-### 3. Does Google accept the mobile User-Agent/profile pairing?
+Live research can determine whether the endpoint currently has a stable explicit field/cookie, but adding one would be a new protocol feature, not parity with the audited path. Until deliberately implemented, do not claim strict DDG safe-search enforcement at request level.
 
-Question:
+## 5. Secondary DuckDuckGo adapter viability
 
-- Does the fixed Nokia User-Agent with Android Chrome transport profile continue to produce normal results rather than a consent or challenge page?
+This optional adapter is real but disabled in the audited default configuration. Before implementing it for Overmind, validate:
 
-Validation:
+- discovery page still exposes `deep_preload_link`;
+- opaque `dp`/API URL behavior still requires discovery;
+- JSON `results` still exposes `u/t/a` and continuation `n`;
+- the arithmetic challenge grammar remains within the documented narrow parser;
+- Firefox impersonation remains required/accepted.
 
-- compare a single fixed profile against a controlled smoke query;
-- do not rotate rapidly.
+This is not a blocker for primary V1.
 
-Fallback:
+## 6. Trait freshness
 
-- select a different coherent profile only as an explicitly tested configuration.
+The compatibility design should ship generated provider trait snapshots. Establish a maintenance process for validating/updating them.
 
-### 4. Is Bing wrapper decoding still base64url with the a1 prefix?
+Questions:
 
-Question:
+- how often should snapshots be refreshed;
+- should refresh run manually in development/CI or as a release task;
+- which locales Overmind promises to support in tests;
+- how to detect provider alias changes without adding runtime latency.
 
-- Do current result links still use ck/a and u values beginning with a1?
+The per-query search path should not depend on live trait scraping.
 
-Validation:
+## 7. Cache persistence decision
 
-- inspect a sanitized result href;
-- test padding and UTF-8 handling.
+Primary DDG source behavior uses persistent provider cache state. Overmind may prefer in-memory TTL state initially.
 
-Fallback:
+Decision needed:
 
-- skip malformed wrapper results and retain direct absolute links;
-- do not follow wrappers over the network.
+- exact persistence across runtime restarts, or
+- process-local parity only.
 
-### 5. Does DuckDuckGo still require vqd for later pages?
+If in-memory is chosen, document it as an operational deviation; request/state semantics within one runtime remain exact.
 
-Question:
+## 8. Hash-key representation decision
 
-- Is the token query/User-Agent relationship and one-hour TTL still valid?
+The audited result map uses the Python integer `hash(result)` directly as the dictionary key. This admits theoretical hash-collision merging.
 
-Validation:
+For an independent implementation, a structured tuple containing the exact identity fields can preserve all ordinary duplicate semantics while eliminating collision ambiguity.
 
-- first-page fixture with hidden vqd;
-- same-query continuation from the same stable User-Agent;
-- separate-query and changed User-Agent negative tests;
-- expiry test.
+Decision needed:
 
-Fallback:
+- reproduce integer-hash storage literally, or
+- use a structured identity key and classify it as a safety/internal deviation.
 
-- support first-page search only and report later pages as unavailable.
+Recommendation for implementation engineering: structured key is acceptable only if parity tests prove identical behavior for all non-collision cases and documentation clearly records the difference.
 
-## DuckDuckGo questions
+## 9. Equal-score tie behavior
 
-### Safe-search field
+Exact source ordering uses stable sort with insertion order and no explicit tie-break. Native async task completion can therefore affect equal-score ordering.
 
-The active HTML form did not show a verified safe-search parameter or cookie despite advertising safe-search capability. Determine whether the current endpoint accepts a stable field. Until then, strict safe-search must either exclude this provider or be labelled best effort.
+Decide whether V1 must reproduce this exactly or whether Overmind wants a deterministic tie-break as a named later ranking mode.
 
-### Cookie names and values
+The compatibility mode should preserve insertion semantics until an explicit product decision changes it.
 
-The observed path uses kl for region and df for time. Verify that the current endpoint still reads them and that a form field is not also required.
+## 10. Host URL output policy
 
-### Challenge source
+Provider parity can produce decoded/normalized URLs without strict HTTP(S)-absolute validation. Before returning results to the agent, Overmind should define whether it:
 
-Determine whether challenge behavior is primarily IP-based, User-Agent-bound, token-bound, or a combination. The implementation does not need to identify the exact cause to degrade safely.
+- exposes parity output unchanged;
+- filters non-HTTP(S) values only at serialization;
+- marks unsafe/unusual URLs as omitted/quarantined.
 
-### Chinese pagination
+Whatever policy is chosen must remain downstream of parity aggregation so it does not silently change score/dedup tests.
 
-Verify whether the zh page-two restriction remains necessary. Keep it as a capability override until repeated live tests show safe support.
+## 11. Body/resource limits
 
-### JSON-style alternative
+The audited source does not implement the custom response-body limits proposed in the earlier research draft. Overmind should choose practical limits for runtime safety based on measured provider pages.
 
-Decide whether the separate d.js JSON-style path adds enough reliability to justify a second adapter. The arithmetic challenge path is not a V1 requirement and must not be executed.
+Validate normal response-size distributions before setting caps. A host cap should fail a provider cleanly rather than truncate markup and emit plausible-but-wrong results.
 
-## Google questions
+## 12. Live smoke-test cadence
 
-- Does omitting num remain correct?
-- Is sca_esv=1 still accepted?
-- Does cr=country... still provide the desired restriction?
-- Should the all-locale request omit lr/cr or send empty values?
-- Are status 302 and sorry URL checks sufficient for current blocks?
-- Which result dates, if any, are stable enough to expose?
-- Is a trait refresh from preferences worth its privacy and latency cost?
+Define a low-rate schedule outside mandatory unit CI. Each run should record only safe operational facts:
 
-## Bing questions
+    provider
+    status
+    content type
+    body size
+    elapsed time
+    expected structure present
+    result count
+    challenge/block classification
 
-- Is the current active request really more reliable without mkt?
-- Do US, CN, and RU still require cc omission?
-- Can page and time filters be implemented through a stable public HTML request?
-- Which body markers distinguish a normal zero-result response from a challenge?
-- Does Bing require cookies or a referer from the deployment network?
-- Is optional HTTP/3 beneficial or merely a fingerprint difference?
+Do not store raw queries, cookies, validation tokens, or full response bodies in routine telemetry.
 
-## Locale questions
+## Implementation readiness gate
 
-- Which caller locale format is guaranteed by the host runtime?
-- Should an unsupported region fall back to language-only or to all-locale?
-- Does the product require strict geographic targeting or only an approximate market?
-- Should the locale trait tables be static, refreshed asynchronously, or bundled per release?
-- How should script tags such as zh-Hant be mapped when no exact provider trait exists?
+The primary V1 can begin now. None of the unresolved questions above prevents implementation because the documented parity behavior is sufficient for:
 
-## Ranking and product decisions
+- transport;
+- Google/Bing/DDG requests;
+- parsers;
+- primary DDG continuation state;
+- normalization;
+- duplicate merge;
+- ranking/grouping;
+- concurrency/deadlines;
+- failure isolation.
 
-- Are all providers equally trusted, or should weights be configurable?
-- Should HTTP and HTTPS share identity for this product?
-- Should fragments be preserved or dropped for page identity?
-- Is a snippet merge based on longer text acceptable, or should provider preference win?
-- Should provider diagnostics be returned to the AI agent or only logged?
-- What final result limit is appropriate for token budget and tool latency?
-- Should a zero-result healthy provider be distinct from an empty blocked response?
-
-## Runtime and dependency decisions
-
-- Does the host already have an async HTTP client and HTML parser?
-- Can the runtime use curl-based browser impersonation wheels on every deployment platform?
-- Does the host permit an event-loop-owned client, or must the library expose a client lifecycle?
-- Are HTTP/2 and HTTP/3 materially helpful for the target egress?
-- Can the host provide structured metrics without adding a new metrics dependency?
-
-## Security decisions
-
-- Will a later tool fetch result pages, or must search remain strictly URL discovery?
-- If fetching is added, where will SSRF validation and network isolation live?
-- Are result snippets stored, cached, or transmitted to another service?
-- What retention policy applies to provider diagnostics?
-- Is disabling TLS verification ever allowed in production?
-
-## Evidence needed before declaring protocol stability
-
-For each provider, retain a small internal validation record containing:
-
-- date and deployment egress region;
-- request parameter names and values;
-- redacted header profile;
-- status and content type;
-- result-container observation;
-- redirect-wrapper example with synthetic or sanitized destination;
-- parser result count;
-- block/challenge outcome if applicable.
-
-Do not store cookies, validation tokens, full query URLs, or full response bodies in the record.
-
-## Decision rule
-
-When a live result disagrees with these documents:
-
-1. Preserve the last known-good fixture.
-2. Record the new response shape in a sanitized fixture.
-3. Mark the old statement as obsolete or provider-version-specific.
-4. Update the adapter contract and regression tests.
-5. Keep the coordinator and result model unchanged unless the semantic contract actually changed.
-
-The subsystem is ready for implementation when all ESSENTIAL_V1 items are either verified live or explicitly guarded behind a typed capability/failure outcome, and no open question would cause silent data corruption or unsafe URL handling.
+Before declaring the tool production-ready, run live smoke validation from the actual deployment network and resolve any external protocol drift discovered there.
