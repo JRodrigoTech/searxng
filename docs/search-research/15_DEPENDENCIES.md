@@ -1,178 +1,148 @@
 # Dependencies
 
-## Selection principles
+## Compatibility principle
 
-The new subsystem should have the smallest dependency set that still provides:
+Dependency choice is not purely ergonomic for this tool. The audited provider paths depend on HTTP/browser-fingerprint behavior and tolerant HTML parsing. A library substitution is acceptable only when compatibility tests prove equivalent provider requests and responses.
 
-- reliable asynchronous HTTP;
-- robust HTML parsing;
-- URL parsing and encoding;
-- locale mapping;
-- bounded state and hashing;
-- deterministic concurrency.
+## Required baseline for parity
 
-Do not add a dependency merely because a larger search application uses it. Every dependency must have a provider or runtime reason and an explicit fallback.
+| Capability | Baseline |
+| --- | --- |
+| Async scheduling | Python `asyncio` or host equivalent |
+| Monotonic deadlines | standard `time` clock |
+| HTTP/browser fingerprint | `curl_cffi` |
+| HTML parsing/XPath | `lxml.html` / lxml XPath |
+| URL parsing/encoding | `urllib.parse` |
+| Base64url | standard `base64` |
+| Locale parsing/best-fit | Babel plus generated provider trait data, or a verified equivalent port |
+| Provider TTL state | provider-scoped cache with expiry and secret/hash keying where required |
+| Concurrency synchronization | asyncio coordination or lock-equivalent semantics |
 
-## Recommended minimum
+## `curl_cffi`
 
-| Capability | Recommendation | Status |
-| --- | --- | --- |
-| Async scheduling | Python asyncio | REQUIRED; standard library |
-| Deadline and monotonic clock | time.monotonic | REQUIRED; standard library |
-| URL parsing/encoding | urllib.parse plus a small tested policy layer | REQUIRED; standard library |
-| Hashing token cache keys | hashlib | REQUIRED; standard library |
-| HTTP | Existing async client in the host runtime; otherwise httpx or aiohttp | REQUIRED, choose one |
-| HTML parsing | lxml.html or selectolax | REQUIRED for robust provider selectors |
-| Locale parsing | Existing runtime locale/Babel support or a bounded mapping table | REQUIRED as a policy, library optional |
-| In-memory TTL state | dict plus monotonic expiry and asyncio lock | REQUIRED; standard library |
-| Structured telemetry | Host runtime logger/metrics interface | REQUIRED as an integration, no new framework |
+For compatibility this is not merely an optimization. Relevant source behavior includes:
 
-## HTTP choice
+- browser impersonation profiles;
+- default Chrome-family profile;
+- Google `chrome99_android` override;
+- secondary DuckDuckGo Firefox override with browser default headers disabled;
+- HTTP/2 selection;
+- conditional HTTP/3 for Bing;
+- curl protocol restrictions;
+- pooled async clients;
+- explicit cookie-discard behavior.
 
-### httpx
+A stock `httpx`/`aiohttp` implementation cannot be assumed equivalent at TLS/browser fingerprint level.
 
-Why it may be needed:
+**PARITY BASELINE:** use `curl_cffi` for the initial implementation.
 
-- clean async client;
-- connection pooling;
-- familiar timeout and response APIs;
-- optional HTTP/2.
+`httpx` or `aiohttp` can be evaluated later behind a transport experiment, but passing functional GET/POST tests alone is insufficient; live provider acceptance and request-profile tests are required.
 
-Provider fit:
+## `lxml`
 
-- Google, Bing, and DuckDuckGo HTML can use ordinary async HTTP if browser-profile fidelity is not required by live tests.
+The audited parsers rely on tolerant HTML parsing and XPath behavior. Google additionally removes an optional XML declaration and then parses using HTML semantics.
 
-Standard-library alternative:
+`lxml` therefore provides the lowest-risk compatibility path. Rewriting selectors into CSS/selectolax/BeautifulSoup can work, but it changes parser semantics and should not happen in the first parity implementation.
 
-- urllib is available but would require a thread or custom async integration and weaker pooling.
+**PARITY BASELINE:** use `lxml`.
 
-Classification: RECOMMENDED default when the host already uses httpx or does not need TLS/browser impersonation matching.
+## Babel and locale traits
 
-### aiohttp
+Provider locale behavior is more than splitting `en-US`:
 
-Why it may be needed:
+- provider-specific language/region tables;
+- all-locale sentinels;
+- aliases;
+- language/script handling;
+- territory-first and language fallback matching;
+- official-language and population-based best-fit logic in the broader locale resolver.
 
-- mature async streaming and pooling;
-- good control over response body limits and cookie jars.
+Two viable compatibility approaches exist:
 
-Provider fit:
+1. depend on Babel and port the generic best-fit rules plus generated provider trait snapshots;
+2. bundle a complete generated lookup table for every locale Overmind will support, with golden parity tests.
 
-- all three HTML paths.
+For broad locale compatibility, option 1 is safer. A tiny hand-written `en/es/zh` map is not feature parity.
 
-Standard-library alternative:
+## Trait data
 
-- urllib plus asyncio.to_thread, with worse cancellation and pooling behavior.
+The larger source system persists generated engine trait data and can refresh it from provider pages/resources. Search calls consume the persisted mapping rather than scraping locale metadata every time.
 
-Classification: VALID alternative.
+The embedded tool should similarly ship a generated snapshot. Optional refresh tooling can live outside the search critical path.
 
-### curl-cffi
+Do not make each agent search depend on live requests to provider preference/region discovery pages.
 
-Why it may be needed:
+## Provider state/cache
 
-- browser impersonation;
-- HTTP/2 and HTTP/3 controls;
-- behavior close to the observed transport profile.
+Primary DuckDuckGo requires a TTL cache for `vqd` keyed by transformed query and User-Agent. The audited source uses a provider-scoped persistent SQLite-backed engine cache and a secret hash of the key material.
 
-Provider fit:
+Secondary DuckDuckGo also stores page-specific provider URLs with two TTLs:
 
-- Google’s mobile profile;
-- Bing’s optional HTTP/3 profile;
-- DuckDuckGo’s coherent browser identity.
+- discovered page-1 URL: 7200 s;
+- learned continuation URL: 3600 s.
 
-Standard-library alternative:
+For a simple single-process Overmind runtime, an in-memory TTL cache is technically sufficient for requests within one process. It is not persistence parity across restarts. If choosing in-memory state, document that deliberate deviation and ensure token/page semantics within a process remain exact.
 
-- none with equivalent browser-fingerprint control.
+A general database framework is not otherwise needed.
 
-Classification: OPTIONAL until live smoke tests demonstrate that ordinary async HTTP is blocked or produces incompatible markup. If selected, pin versions and test platform wheels.
+## Standard-library dependencies
 
-## HTML parsing choice
+Use standard library for:
 
-### lxml
+- `urllib.parse` query/url operations;
+- `base64.urlsafe_b64decode`;
+- hashing for private cache keys if reimplemented;
+- dataclasses/types where useful;
+- monotonic clocks;
+- asyncio task coordination.
 
-Why it may be needed:
+Provider-specific behavior should not be hidden behind large generic crawling/search packages.
 
-- tolerant HTML parsing;
-- XPath and class-structure selection;
-- efficient parsing of small result pages;
-- handles the XML-like Google response after declaration removal.
+## What the embedded tool does not need
 
-Alternative:
+The search library does not need:
 
-- selectolax provides fast CSS-oriented parsing;
-- BeautifulSoup is convenient but adds a parser dependency and can be slower or less precise for structural tests;
-- standard-library html.parser requires more custom tree handling.
-
-Classification: RECOMMENDED if the host already includes it; otherwise selectolax is a reasonable V1 alternative. Use one parser consistently across providers.
-
-### BeautifulSoup
-
-Why it may be useful:
-
-- simple parser API for small fixtures;
-- readable selectors.
-
-Why it is not the default:
-
-- usually requires an additional parser backend for robust behavior;
-- encourages loose selection that can silently return navigation text.
-
-Classification: OPTIONAL, not required when lxml or selectolax is available.
-
-## Locale support
-
-A full internationalization library is not required if V1 supports a bounded set of common language-country tags and ships provider trait tables.
-
-### Babel
-
-Use when:
-
-- the host already depends on it;
-- language/script/territory parsing and best-fit selection are needed.
-
-Alternative:
-
-- parse a strict subset of BCP-47-like tags with the standard library and map through explicit provider tables.
-
-Classification: OPTIONAL. Avoid making a network search depend on a runtime trait refresh or a large locale database.
-
-## State and persistence
-
-No database is required for V1:
-
-- DuckDuckGo token state can be in-memory with TTL.
-- Locale traits can be static configuration plus optional refresh.
-- Circuit-breaker state can be in-memory.
-
-SQLite is only justified later if multiple processes must share token/trait state and the security model for that state is documented. Do not persist raw queries or validation tokens by default.
-
-## What is explicitly not needed
-
-- Flask or another web framework;
-- an HTTP server;
+- Flask;
+- a public HTTP server;
+- templates/UI;
 - Docker;
-- a database;
-- a configuration framework;
 - browser automation;
+- Selenium/Playwright;
 - a JavaScript runtime;
-- a CAPTCHA-solving service;
-- a search-index library;
-- a general plug-in framework;
-- a message queue.
+- a search index;
+- a queue system;
+- the larger application's plugin framework.
 
-## Version and packaging guidance
+The secondary DuckDuckGo challenge logic does not justify a JS runtime; its audited behavior is a narrow arithmetic parser.
 
-**Recommendation:** Target a currently supported Python version already used by the host application, preferably one with modern asyncio cancellation behavior. Pin lower and upper dependency bounds, run parser fixtures across supported platforms, and verify that any browser-impersonation wheel is available for the deployment OS.
+## Suggested package dependency set
 
-Do not make the public search API expose library-specific response objects. Return project-owned dataclasses or typed dictionaries so the HTTP/parser dependency can change later.
+For the first high-fidelity implementation:
 
-## Dependency acceptance tests
+    curl-cffi
+    lxml
+    Babel
 
-Before choosing a library, verify:
+plus Python standard library and Overmind's existing runtime/tool interfaces.
 
-- async cancellation actually closes the response;
-- connection pools are reused;
-- compressed responses are bounded after decompression;
-- HTML parsing does not execute external entities or resources;
-- Unicode and malformed input are handled;
-- the library does not silently follow result URLs;
-- Windows and deployment-platform installation works.
+If any of these already exist in the host dependency graph, reuse compatible pinned versions.
+
+## Version pinning
+
+Browser impersonation profiles are library/version-sensitive. Pin a tested `curl_cffi` range and run provider smoke tests when upgrading.
+
+Parser behavior and Babel locale data can also shift across major versions. Golden fixtures and locale mapping tests should be part of dependency upgrade CI.
+
+## Acceptance gate for replacing a dependency
+
+A replacement is acceptable only if it passes:
+
+- exact request parameter/header/cookie tests;
+- provider browser-profile requirements or proven equivalent live acceptance;
+- HTML fixture extraction tests;
+- timeout/deadline tests;
+- URL/encoding tests;
+- locale trait tests;
+- live smoke tests from intended egress.
+
+The implementation agent should prioritize compatibility over minimizing three well-justified dependencies.
