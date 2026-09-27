@@ -1,76 +1,71 @@
 # Bing Web Search protocol
 
-## Endpoint strategy
+## Status and compatibility target
 
-| Item | Behavior |
+This document specifies the behavior that the new search tool must reproduce for the Bing web path. The goal is request/parser compatibility, including its current limitations and failure behavior.
+
+## Endpoint and capabilities
+
+| Item | Audited behavior |
 | --- | --- |
-| Endpoint | https://www.bing.com/search |
+| Endpoint | `https://www.bing.com/search` |
 | Method | GET |
-| Query encoding | Standard URL query encoding |
-| Body | None |
-| Expected response | Standard HTML result page |
-| JavaScript | Not required for ordinary result extraction |
-| Active pagination | Not advertised by the active adapter |
-| Active time filter | Not advertised by the active adapter |
+| Query encoding | `urllib.parse.urlencode` semantics |
+| Body | none |
+| Response | HTML |
+| JavaScript | not required for the extracted first-page results |
+| Paging | not exposed by this web adapter |
+| Time range | not exposed by this web adapter |
+| Safe search | yes |
+| Region | yes |
+| HTTP/3 | enabled for this provider when transport conditions allow it |
 
-**Observation:** The active provider exposes general web search and safe search, but its capability flags do not expose pagination or time-range filtering. The future V1 should not claim those filters for Bing until a separate request/fixture investigation verifies them.
+The generic capability gate skips this provider when a caller asks for page > 1 or a time range, because this adapter does not advertise those capabilities.
 
-## Request parameters
+## Request construction
 
-The active search request contains:
+The request always contains:
 
-| Parameter | Value |
-| --- | --- |
-| q | User query |
-| adlt | off, moderate, or strict |
-| setlang | Language portion of the selected market when a region is available |
-| cc | Country portion for most countries; omitted for US, CN, and RU in the observed policy |
+    q=<query>
+    adlt=<safe-search-value>
 
-The active request does not use the helper-style market parameter mkt, although a separate locale helper can produce it. Do not add mkt merely because it exists in a utility function; executable request construction is authoritative.
+Safe-search mapping is exact:
 
-### Safe-search mapping
+    0 -> off
+    1 -> moderate
+    2 -> strict
 
-| Generic option | Bing parameter |
-| --- | --- |
-| off | adlt=off |
-| moderate | adlt=moderate |
-| strict | adlt=strict |
+Unknown numeric values fall back to `off`.
 
-### Region mapping
+### Region behavior
 
-1. Resolve a provider region such as en-us or es-es.
-2. Split the value into language and country.
-3. Set setlang to the language.
-4. Set cc to the country unless it is us, cn, or ru.
-5. Omit cc for those excluded codes because the observed behavior treats them as undesirable Bing parameters.
+The provider trait resolves a region string such as `en-us` or `es-es`. If the resolved value is empty or equals the all-region sentinel `clear`, no locale parameters are added.
 
-The no-region fallback is the provider’s default; do not fabricate a country.
+Otherwise:
 
-## Request fingerprint
+1. split the region on the first `-`;
+2. send the language part as `setlang`;
+3. send the country part as `cc` unless the country is `us`, `cn`, or `ru`.
 
-### Active search request
+The code intentionally omits `cc` for those three country values because they were observed to produce poor/junk behavior.
 
-The provider does not add a custom header set to its ordinary search request. The common transport/provider layer can add an Accept-Language value and a browser-profile header set.
+A separate helper can construct `mkt=<language-country>` for other Bing engines, but the ordinary web request does **not** call that helper. **PARITY MUST:** do not add `mkt` to this path.
 
-| Field | Classification | Guidance |
-| --- | --- | --- |
-| User-Agent | RECOMMENDED | Use the transport’s coherent browser profile |
-| Accept | RECOMMENDED | Browser-like HTML accept value |
-| Accept-Language | RECOMMENDED | Derive from the caller locale |
-| Referer | OPTIONAL | Not explicitly required by the active search path |
-| Sec-Fetch-* | OPTIONAL | Let a coherent browser profile supply them if supported |
-| DNT / Sec-GPC | OPTIONAL | Not required by the search request |
-| Cookies | OPTIONAL | No search-specific cookie is required by the active path |
-| Content-Type | NOT_NEEDED | GET with no body |
-| Redirects | RECOMMENDATION: do not follow external redirects automatically | Decode result wrappers locally |
+## Transport fingerprint
 
-### Region discovery request
+The engine itself does not add a custom search-header set. It receives common online-request headers, including locale-derived `Accept-Language` when enabled.
 
-The optional startup discovery request is:
+The transport baseline uses browser impersonation with the default browser profile and supports HTTP/2. This provider additionally sets `enable_http3 = true`; when there is no proxy and the transport supports it, the provider-specific network selects HTTP/3. With a proxy, it falls back according to the common transport rules.
+
+Redirect following remains disabled by the generic online request defaults unless explicitly changed elsewhere.
+
+### Trait-discovery request
+
+Region traits can be refreshed from:
 
     GET https://www.bing.com/account/general
 
-The observed header set is:
+with a five-second timeout and this explicit header shape:
 
     User-Agent: generated browser-like value
     Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8
@@ -81,112 +76,93 @@ The observed header set is:
     Sec-GPC: 1
     Cache-Control: max-age=0
 
-This discovery request has a short timeout and is not part of every search if traits are already cached.
+The trait parser extracts region links, records `clear` as the all-region sentinel, derives official-language market strings, and contains a provider-specific `zh-hk -> en-hk` alias.
 
-## Locale traits
+For the embedded tool, use an equivalent generated snapshot on the critical path and refresh it out of band if desired.
 
-The region map is built from links in a region-selection area of the account page. The parser reads the country query value from those links, records an all-locale sentinel clear, and maps supported languages to market strings. There are provider-specific aliases such as a Hong Kong Chinese mapping.
+## Response parser
 
-**Observation:** The stored Bing trait table contains region mappings but no general language mapping table comparable to Google’s language restriction map.
+Parse the HTML document and iterate exactly these standard result blocks:
 
-**Recommendation:** Keep a static common-market map and use the discovery page only as a bounded refresh. If discovery fails, use the locale’s language-country form when syntactically valid and record a warning.
+    //ol[@id="b_results"]/li[contains(@class, "b_algo")]
 
-## Result structure
+For each block:
 
-The parser:
+1. select the first `.//h2/a`;
+2. if no link exists, skip the block;
+3. read `href` and the extracted text title;
+4. if either href or title is empty, skip the block;
+5. if the href is the known Bing wrapper, attempt the exact decoding rule below;
+6. collect all `.//p` elements;
+7. remove descendants exactly matching `span[@class="algoSlug_icon"]` from those paragraph trees;
+8. extract the remaining paragraph text as content;
+9. append the result.
 
-1. Locates the ordered result list with id b_results.
-2. Selects list items carrying the b_algo result class.
-3. Reads the title and destination from the h2 link.
-4. Removes decorative span elements carrying the algoSlug_icon class from the paragraph.
-5. Uses the remaining paragraph text as the snippet.
+The parser returns legacy dictionary-shaped results containing `url`, `title`, and `content`; the common result layer subsequently normalizes them.
 
-Items without a title or href are skipped. The result position is the ordinal of accepted result items.
+## Exact wrapper decoding
 
-### Current protocol observations: brittle selectors
+Only hrefs beginning exactly with:
 
-The current structural selection is equivalent to:
+    https://www.bing.com/ck/a?
 
-    ol#b_results
-      -> li whose class contains b_algo
-         -> h2 -> a
-         -> p, after removing span.algoSlug_icon
+enter the wrapper path.
 
-Keep these markers in sanitized HTML fixtures and add a live smoke test that detects a sudden zero-result parse.
+The algorithm is:
 
-## Redirect/wrapper decoding
+1. parse the wrapper query;
+2. read the first `u` value;
+3. if there is no `u`, leave the original href unchanged;
+4. if `u` does not begin with `a1`, leave the original href unchanged;
+5. otherwise remove the first two characters (`a1`);
+6. append `=` padding until the payload length is divisible by four;
+7. URL-safe-base64 decode;
+8. decode the bytes as UTF-8 using `errors="replace"`;
+9. replace `href` with that decoded string.
 
-Bing may return:
+### Important failure semantics
 
-    https://www.bing.com/ck/a?u=a1<base64url-payload>
+There is no local `try/except` around base64 decoding in this parser. A malformed `a1` payload can therefore raise an exception that escapes the provider parser. The common online processor catches the exception and records the provider as failed; it is **not** an item-level skip in the current behavior.
 
-The observed recovery algorithm is:
+There is also no post-decode requirement that the recovered string be absolute or use HTTP(S). Likewise, a direct non-wrapper href is not subjected to an absolute-URL check in this adapter.
 
-1. Parse the wrapper URL query.
-2. Read the u parameter.
-3. Require the value to begin with a1.
-4. Remove the a1 prefix.
-5. Add one or more equals signs until the length is divisible by four.
-6. Decode with URL-safe base64.
-7. Decode bytes as UTF-8 using replacement for malformed byte sequences.
-8. Require the result to be an absolute URL.
+**PARITY MUST:** if exact compatibility is the target, do not silently convert malformed-wrapper failure into a per-item skip and do not add absolute-URL rejection inside the provider parser. A host-level security validation may be layered later only as a deliberate, tested deviation.
 
-If the href is not the known wrapper, preserve it as-is after absolute-URL validation.
+## Empty and malformed pages
 
-Synthetic examples:
+The provider-specific parser has no explicit CAPTCHA or zero-result structural detector. It simply emits whatever matching `b_algo` blocks it can parse. Generic HTTP handling catches HTTP-level access denial, rate limiting, CAPTCHA signatures recognized globally, and other HTTP errors before this parser runs.
 
-    wrapper value: a1aHR0cHM6Ly9leGFtcGxlLnRlc3QvZG9jcz9wYWdlPTE
-    payload:       aHR0cHM6Ly9leGFtcGxlLnRlc3QvZG9jcz9wYWdlPTE
-    decoded:       https://example.test/docs?page=1
+Therefore a successful HTTP response with no `b_algo` blocks returns an empty result list rather than a provider-specific `ParseFailure` from this adapter.
 
-The payload above is synthetic and exists only to illustrate padding and decoding. A malformed wrapper must become a typed parse failure or item-level skip according to the failure policy; never issue a second network request to decode it.
+## HTTP error interaction
 
-## Anti-automation and failure behavior
+The common transport/error layer handles status errors before parsing. In particular:
 
-The generic transport can identify status 403, 429, 503, explicit challenge HTML, and connection failure. Bing-specific parser behavior should additionally treat the following as suspicious:
+- 402/403 -> access denied;
+- 429 -> too-many-requests/rate-limit failure;
+- recognized Cloudflare/reCAPTCHA patterns -> CAPTCHA/access-denied failure;
+- other status >= 400 -> underlying HTTP error.
 
-- a response that is successful HTML but contains no result list and has a challenge/login marker;
-- a result wrapper that decodes to an invalid destination;
-- a sudden change from a normal result count to a tiny document with no result structure.
+The online processor catches these failures and isolates them from sibling providers.
 
-Do not solve challenges or retry rapidly. Return Blocked, CaptchaDetected, RateLimited, or ParseFailure with a provider cooldown recommendation.
+## Compatibility tests
 
-## Pagination and time filters
+Golden tests should assert:
 
-**Observation:** The active adapter does not advertise page support or time-range support. The generic request preparation layer therefore rejects page values above one and time filters for Bing.
+- exact `q` and `adlt` mapping;
+- `setlang` behavior;
+- `cc` omission for `us`, `cn`, `ru`;
+- no `mkt` in this web request;
+- page > 1 and time range are capability-rejected before request execution;
+- exact `b_results/b_algo` selection;
+- missing link/href/title skips the item;
+- exact `algoSlug_icon` removal;
+- valid `ck/a?u=a1...` decoding including missing base64 padding;
+- no absolute-URL validation after decoding;
+- malformed `a1` base64 escapes the parser and becomes provider-level failure;
+- an HTTP-200 page with zero matching result blocks yields an empty list;
+- provider network configuration requests HTTP/3 when allowed.
 
-**Recommendation:** Treat later pages and time filters as USEFUL_LATER. Add them only after recording exact live requests and parser fixtures. Do not emulate them by appending undocumented parameters without tests.
+## Live validation boundary
 
-## Minimal V1
-
-### ESSENTIAL_V1
-
-- One GET to the standard search endpoint.
-- q and adlt construction.
-- setlang and conservative cc region handling.
-- coherent browser-like transport headers.
-- b_results/b_algo extraction.
-- title, snippet, and href extraction.
-- ck/a wrapper decoding.
-- typed block and parse failure.
-
-### USEFUL_LATER
-
-- Trait refresh from the account page.
-- Verified Bing pagination.
-- Verified Bing date filtering.
-- Published-date extraction.
-
-### NOT_NEEDED
-
-- Bing account/session automation.
-- JavaScript execution.
-- Arbitrary URL fetching.
-
-## Unknowns requiring live validation
-
-- Whether the current HTML class names remain stable.
-- Whether the excluded country list still has the same behavior.
-- Which status/body combinations indicate a Bing CAPTCHA rather than a generic block.
-- Whether the ck/a payload may contain a second encoding in future responses.
-- Whether an endpoint-specific cookie improves reliability.
+Periodically verify the HTML selectors, `ck/a` wrapper format, region exclusions, and transport acceptance. Changes in public markup should update the compatibility fixtures and this document before changing implementation behavior.
