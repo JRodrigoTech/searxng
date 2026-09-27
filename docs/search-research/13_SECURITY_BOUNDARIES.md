@@ -1,155 +1,188 @@
 # Security boundaries
 
-## Threat model
+## Purpose
 
-Search responses come from external services and from arbitrary third-party web publishers. Titles, snippets, URLs, thumbnail URLs, dates, and metadata are untrusted data. The search subsystem is an input source for an AI agent and must not turn provider text into instructions.
+The search tool receives untrusted internet data and feeds an AI agent. Security controls must therefore be explicit. At the same time, this documentation targets behavioral compatibility with the audited search pipeline. Security hardening that changes which results survive must be clearly separated from provider-parity behavior.
 
-## Search data is not authority
+## Trust boundary
 
-The caller and downstream agent must treat all of the following as untrusted:
+All provider-derived values are untrusted data:
 
-- result titles;
-- snippets;
-- provider suggestions;
-- URL path/query text;
-- page names and authors;
-- result metadata;
-- challenge-page text.
+- titles;
+- snippets/content;
+- URLs;
+- thumbnails;
+- suggestions;
+- answer text;
+- dates and metadata;
+- challenge/error page content.
 
-The response schema should make this boundary obvious. A result is data, not a command, policy, or system message. The tool description should tell the agent not to follow instructions embedded in result text.
+They must never become system/developer instructions or acquire tool authority. The tool returns data; downstream context compilation must preserve that distinction.
 
-## HTML and script safety
+## Search versus fetch
 
-- Parse HTML with a non-executing parser.
-- Never evaluate provider JavaScript.
-- Never interpret script nodes as result content.
-- Convert selected text nodes to plain text.
-- Escape result text at the presentation layer.
-- Do not render arbitrary provider HTML in a privileged UI.
+This component discovers search results. It does not fetch arbitrary result destinations:
 
-The inactive DuckDuckGo JSON-style path contains an arithmetic challenge in response content. The new subsystem must not execute it. Treat it as anti-automation evidence and return a typed failure.
+    web search != page fetch
 
-## URL safety
+A later page-fetch tool requires its own SSRF controls, redirect policy, DNS/IP checks, body limits, credential isolation, and authorization boundary. Search-result URLs alone are not trusted destinations.
 
-The search component does not fetch result destinations. This is an important security boundary:
+## Provider parsing
 
-    search result discovery  !=  arbitrary page fetching
+The primary three adapters do not require a JavaScript runtime:
 
-If a later feature fetches a result URL, it needs a separate SSRF policy:
+- Google: tolerant HTML parsing of the mobile representation;
+- Bing: HTML parsing;
+- primary DuckDuckGo: HTML parsing.
 
-- validate scheme;
-- reject userinfo;
-- resolve DNS and check every address;
-- block localhost, loopback, link-local, multicast, private, and reserved ranges unless explicitly allowed;
-- re-check after redirects;
-- bound redirect count, body size, and response time;
-- isolate credentials and proxy settings;
-- use a separate capability and audit trail.
+The secondary DuckDuckGo JSON/script adapter contains a narrow arithmetic challenge reconstruction. It parses a small provider-generated grammar and computes a number; it does not run arbitrary provider JavaScript in a browser/runtime. For exact secondary-adapter parity that narrow behavior is documented separately. Do not generalize it into `eval`, a JavaScript VM, or arbitrary script execution.
 
-Result URL parsing alone is not sufficient SSRF protection because DNS rebinding and redirect chains can change the destination.
+## URL behavior: parity versus host validation
 
-## Redirect safety
+Provider-parity behavior is intentionally permissive in places:
 
-Provider wrapper decoding is local string processing. It must not perform a network request.
+- Google unwraps its known redirect and returns the decoded string without an absolute-HTTP(S) check;
+- Bing decodes its known wrapper and likewise does not perform an absolute-HTTP(S) check;
+- common result normalization can assign `http` when a parsed result lacks a scheme;
+- identity preserves most URL spelling details and ignores scheme for ordinary-result hashing.
+
+Therefore a rule such as “provider parser must reject every non-absolute/non-HTTP URL” would change compatibility.
+
+Recommended boundary:
+
+    provider parse
+      -> source-compatible normalization/merge/rank
+      -> host output validator
+      -> agent-facing SearchResult
+
+The host validator may reject or quarantine unsafe schemes/userinfo/control characters before exposing results to later capabilities. Tests must distinguish that host policy from provider parity.
+
+## Provider wrapper decoding
+
+Known wrappers are decoded locally; decoding must not fetch the wrapped destination.
+
+Compatibility decoders are bounded by their known formats:
+
+- Google `/url?q=` transformation;
+- Bing `ck/a?u=a1...` base64url transformation;
+- primary DuckDuckGo uses direct result hrefs.
+
+If the host applies a stricter post-decode URL policy, it belongs after the parity decoder.
+
+## HTML/XML parser safety
+
+Use non-executing parsing. The parser must not intentionally retrieve external entities/resources. Provider markup must be treated as bytes/text input only.
+
+The exact provider selectors should be run only against bounded responses from their fixed provider origins. Do not expose a general XPath/selector facility to the agent.
+
+## Response-size hardening
+
+The audited source path does not provide the bespoke compressed/decompressed limits proposed in the first research draft. Overmind should still impose reasonable transport/body limits because the search capability processes external data.
+
+Such limits are a host security boundary and must be sized so normal compatibility fixtures succeed. A body exceeding a host cap should produce a bounded provider failure, not partial parsing of unbounded input.
+
+## Cookies and token state
+
+Provider state includes region/time cookies, validation tokens, trait caches, and request identity.
 
 Rules:
 
-- accept only known wrapper formats;
-- decode one bounded layer;
-- require an absolute HTTP(S) destination;
-- reject control characters and credentials;
-- preserve the decoded destination only after validation;
-- never treat a provider redirect host as the final identity.
+- scope state by provider;
+- never expose cookies or `vqd` in the agent result;
+- preserve query/User-Agent binding where required;
+- preserve TTL semantics;
+- avoid logging token values;
+- do not let one provider mutate another provider's state;
+- if the host uses in-memory state instead of persistent cache, document that as a persistence deviation.
 
-## Response-size and decompression safety
+## Logging
 
-Enforce limits before and after decompression. Protect against:
+Provider-controlled values can contain control characters or misleading syntax. Prefer structured logs with bounded/redacted values.
 
-- very large HTML responses;
-- compressed data that expands unexpectedly;
-- deeply nested or malformed markup;
-- huge numbers of DOM nodes;
-- large attribute values;
-- invalid byte sequences.
+Safe operational fields include:
 
-Use a parser configuration that does not fetch external entities or resources. XML-like Google output must be parsed without network-enabled entity expansion.
+    provider
+    phase
+    status_code
+    elapsed_ms
+    result_count
+    timeout
+    failure_class
 
-## Encoding safety
+Avoid normal logs containing:
 
-- Prefer the response charset when trustworthy.
-- Use a safe replacement policy for invalid bytes.
-- Reject undecodable control-heavy responses.
-- Normalize text for display only after decoding.
-- Avoid logging undecoded bytes.
+- raw query URLs;
+- cookies;
+- validation tokens;
+- complete HTML/JSON bodies;
+- proxy credentials;
+- arbitrary snippets as metric labels.
 
-Do not treat an encoding failure as permission to reinterpret arbitrary bytes as executable content.
+## TLS and transport identity
 
-## Cookies and validation tokens
+TLS verification remains enabled by default. Browser impersonation changes request fingerprint but does not replace certificate verification.
 
-Cookies and DuckDuckGo validation tokens are transport state, not search results:
+The compatibility transport uses provider-specific browser/TLS profiles. Security hardening must not silently replace them with unrelated fingerprints and then attribute resulting blocks to provider instability.
 
-- store them only in provider-scoped state;
-- apply TTL and query/User-Agent binding;
-- redact them from logs and telemetry;
-- do not return them to the caller;
-- clear them on suspected block or token mismatch;
-- do not share them across unrelated providers.
+## Prompt-injection boundary
 
-## Logging and telemetry injection
+The final tool response should structurally identify provider-derived fields as external content. Do not concatenate snippets into trusted instruction strings.
 
-Provider titles, snippets, hosts, and error text can contain newlines, control characters, or misleading structured-log syntax. Before logging:
+If the agent later fetches a result page, that fetched page remains untrusted even when several search providers agreed on its URL.
 
-- use structured fields rather than string interpolation;
-- normalize or escape control characters;
-- truncate values;
-- prefer host and status over full URLs;
-- use a low-cardinality failure code.
+## SSRF requirements for a future fetch capability
 
-Never include arbitrary provider text in a metric name or label.
+A separate page-fetch capability should, at minimum:
 
-## Network and TLS
+- permit only expected schemes;
+- reject userinfo;
+- resolve DNS and validate every resolved address;
+- block loopback, link-local, private, multicast, and reserved ranges unless explicitly authorized;
+- re-evaluate redirects;
+- bound redirect count/time/body;
+- isolate credentials and proxy configuration;
+- defend against DNS rebinding where practical;
+- maintain its own authorization and audit trail.
 
-- TLS verification is enabled by default.
-- A custom CA bundle is explicit deployment configuration.
-- Disabling verification must be visible in configuration and telemetry.
-- Proxy configuration is a trust boundary; do not log proxy credentials.
-- Browser impersonation does not replace TLS verification.
+None of those checks should be implemented by secretly causing the search parser to fetch result URLs.
 
-## Prompt-injection resistance
+## Resource bounds
 
-The downstream agent may see snippets. The tool response should:
+Host-level bounds should cover:
 
-- label them as quoted external content;
-- keep provider diagnostics separate from result text;
-- never concatenate snippets into an instruction template;
-- avoid hidden metadata fields that can be interpreted as tool commands;
-- preserve source/provider labels for citation and skepticism.
-
-The search tool should not automatically summarize or obey text found in result pages.
-
-## Resource isolation
-
-Bound:
-
-- number of providers;
-- number of result blocks parsed;
-- text and metadata lengths;
-- total response bytes;
-- redirects;
+- enabled provider count;
+- search deadline;
+- response bytes;
+- parsed result count;
+- title/content lengths;
+- state/cache growth;
 - retries;
-- total time.
+- final tool result count.
 
-Use separate cancellation and cleanup paths so an uncooperative provider cannot hold the AI runtime indefinitely.
+Compatibility normalization already limits title/content to 200/1200 characters. Additional result-count/body limits are host controls.
 
-## Security review checklist
+## Security/parity test matrix
 
-- [ ] No provider JavaScript is executed.
-- [ ] No result URL is fetched by search.
-- [ ] Known wrappers are decoded locally and bounded.
-- [ ] HTTP(S) scheme and host are validated.
-- [ ] Cookies and tokens are redacted.
-- [ ] HTML/XML parsers cannot fetch external resources.
-- [ ] Response and decompression limits are enforced.
-- [ ] Logs escape provider-controlled text.
-- [ ] Provider text is labelled untrusted in the tool contract.
-- [ ] TLS verification remains on by default.
+Tests should prove both layers independently:
+
+| Case | Compatibility expectation | Host expectation |
+| --- | --- | --- |
+| Google decoded unusual URL | decoder reproduces source output | output policy may quarantine it |
+| Bing decoded non-HTTP string | parser reproduces decoded string if decoding succeeds | output policy may reject it |
+| Provider snippet contains instructions | preserved as ordinary text | never promoted to trusted instruction |
+| DDG `vqd` | used internally with exact binding/TTL | never returned/logged |
+| Secondary DDG arithmetic challenge | narrow parser can reproduce it when that adapter is enabled | no arbitrary JS execution |
+| Result destination | never fetched by search | separate fetch authorization required |
+
+## Checklist
+
+- [ ] Provider text remains untrusted.
+- [ ] Search does not fetch arbitrary result URLs.
+- [ ] Compatibility wrapper decoding is local only.
+- [ ] Host URL validation is separated from provider-parity parsing.
+- [ ] No arbitrary JavaScript execution exists.
+- [ ] Cookies/tokens are provider-scoped and redacted.
+- [ ] TLS verification remains enabled.
+- [ ] Request fingerprint parity is tested.
+- [ ] Response/resource limits are host-level and bounded.
+- [ ] A future fetch tool receives independent SSRF controls.
