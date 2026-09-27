@@ -1,202 +1,171 @@
 # Result model and normalization
 
-## Why several models are needed
+## Compatibility target
 
-Provider documents contain provider-specific fields and sometimes wrapper URLs. A single mutable object cannot safely represent all stages. Use four conceptual stages:
+Provider parsers emit either typed main-result objects or legacy dictionary-shaped results. The common aggregation layer normalizes them before duplicate detection and ranking. For compatibility, normalization must occur **before hashing/merge** and must preserve the exact fields used by result identity.
 
-    RawProviderItem
-        |
-        v
-    ProviderResult
-        |
-        v
-    NormalizedResult
-        |
-        v
-    MergedResult
-        |
-        v
-    SearchResponse item
+## Main-result fields relevant to web search
 
-The names are design terminology, not a requirement to copy any existing class hierarchy.
+A normalized main result carries at least:
 
-## Raw provider item
+    url
+    parsed_url
+    title
+    content
+    thumbnail
+    img_src
+    engine
+    engines
+    positions
+    priority
+    score
+    template
+    category
 
-This is the parser’s short-lived representation. It may contain:
+Optional metadata such as publication date, author, or other fields can exist but is not required from the three audited general-web adapters.
 
-- raw title nodes or text;
-- raw snippet text;
-- raw href;
-- provider wrapper URL;
-- raw thumbnail;
-- provider-specific date/author fields;
-- parser warnings.
+The public tool may later project this into a smaller `SearchResult`, but merge/ranking compatibility should operate on equivalent internal fields first.
 
-Raw items must not leave the provider adapter. They may contain HTML-derived text and are untrusted.
+## Engine provenance
 
-## ProviderResult
+Before normal main-result insertion:
 
-ProviderResult is the first validated representation:
+1. the result's `engine` is filled from the provider when absent;
+2. common field normalization runs;
+3. normalization adds the non-empty engine name to the result's `engines` set.
 
-    ProviderResult
-      provider: fixed provider identifier
-      title: non-empty text
-      destination_url: absolute URL
-      snippet: optional text
-      provider_position: positive integer
-      published_at: optional instant/date
-      thumbnail: optional absolute URL
-      metadata: bounded provider-neutral map
+When duplicates merge, the `engines` set is unioned. The single `engine` field remains a primary/origin engine value and is not the same thing as the complete provenance set.
 
-The destination URL must already have known provider wrappers removed. If an item cannot produce an absolute URL, it is not a ProviderResult.
+## Exact text normalization
 
-## NormalizedResult
+Runs matching spaces, tabs, or newlines are collapsed to one ordinary space and surrounding whitespace is stripped.
 
-The normalizer applies common invariants:
+Limits are:
 
-    NormalizedResult
+    title   = 200 characters
+    content = 1200 characters
+
+When a field exceeds its limit:
+
+1. take the first `max_length` characters;
+2. split at the final space in that truncated slice;
+3. keep the text before that space;
+4. append `" …"`.
+
+This is character-based Python string behavior, not byte truncation.
+
+After normalization, if `content == title`, content becomes the empty string.
+
+**PARITY MUST:** apply these transformations before hashing/merge because longer-title/content merge decisions operate on normalized values.
+
+## Exact URL normalization
+
+When `url` exists but `parsed_url` does not:
+
+    parsed_url = urllib.parse.urlparse(url)
+
+If `url` is not a string, the result's URL is cleared and parsed URL becomes absent.
+
+When a parsed URL exists:
+
+1. if the complete network-location string begins with `xn--`, decode that netloc through IDNA into Unicode;
+2. if the URL has no scheme, set scheme to `http`;
+3. preserve the parsed path;
+4. regenerate the string URL from the parsed result.
+
+Important consequences:
+
+- the common normalizer does not require an HTTP/HTTPS scheme;
+- a schemeless URL can become `http:<...>` according to `urlparse` structure rather than being rejected;
+- hostname case is not explicitly canonicalized here;
+- default ports are not removed;
+- query order is not changed;
+- fragments are retained;
+- tracking parameters are retained;
+- `www.` is retained;
+- trailing/repeated slashes are retained;
+- IDNA decoding occurs only when the entire parsed netloc starts with `xn--` in this implementation.
+
+A stricter host security layer can validate result URLs before exposing/fetching them, but that is a deliberate behavioral boundary after compatibility aggregation, not the observed normalizer.
+
+## Publication dates
+
+When `publishedDate` exists, normalization attempts to generate a formatted string using:
+
+    %Y-%m-%d %H:%M:%S%z
+
+If Python raises `ValueError` for the date, `publishedDate` is cleared.
+
+The three main web adapters covered by V1 generally do not populate a publication date for ordinary results.
+
+## Provider position assignment
+
+Positions are **not** raw DOM indexes and are not assigned inside all provider parsers.
+
+The result container keeps a `main_count` separately for each provider call. For every accepted main result, it increments this count and passes that count as the result position into merge.
+
+Side channels such as suggestions, answers, corrections, infoboxes, and engine data do not consume a normal main-result position.
+
+A malformed/skipped result that never reaches main-result insertion likewise does not consume a position.
+
+Therefore provider position is:
+
+    ordinal among accepted main results from that provider
+
+starting at 1.
+
+## Typed and legacy provider outputs
+
+Google and primary DuckDuckGo emit typed main-result objects. Bing returns legacy dictionaries containing `url`, `title`, and `content`; the aggregation layer wraps these into a legacy-result compatibility type and then applies the same common normalization.
+
+The new tool does not need to reproduce two Python class hierarchies, but its tests must prove equivalent normalized values before dedupe/ranking.
+
+## Side-channel results
+
+The common container distinguishes normal results from:
+
+- suggestions;
+- answers;
+- corrections;
+- infoboxes;
+- provider engine data.
+
+These do not flow through the ordinary main-result hash/ranking path.
+
+For the initial tool response, returning only ranked main results is acceptable. That is an output-surface simplification, not a reason to change how provider parsers identify their normal results.
+
+## Public tool projection
+
+After compatibility merge/ranking, a compact external result can be projected as:
+
+    SearchResult:
       title
       url
-      display_url
-      snippet
-      provider
-      provider_position
-      published_at
-      thumbnail
-      metadata
-      identity
-
-For V1, url and display_url may be the same value. Keeping both conceptual fields prevents a future identity rewrite from changing what the caller sees.
-
-### Required invariants
-
-- title is non-empty after whitespace normalization;
-- url is absolute and has an allowed HTTP-family scheme;
-- provider is one of the enabled provider identifiers;
-- provider_position starts at one;
-- snippet is optional and bounded;
-- thumbnail is optional and must not be fetched by the search subsystem;
-- identity is calculated only after redirect unwrapping and URL validation;
-- metadata is bounded in size and value length.
-
-## MergedResult
-
-MergedResult contains one display record plus provenance:
-
-    MergedResult
-      title
-      url
-      snippet
-      identity
-      providers: set of provider identifiers
-      observations:
-        - provider
-          provider_position
-          observed_url
-          title
-          snippet
+      snippet        # normalized internal content
       score
-      published_at
-      thumbnail
-      metadata
+      providers
+      positions
+      thumbnail?
 
-The observations list is important. A provider set alone cannot explain where a result appeared, and an unlabelled list of positions cannot tell which provider produced a position.
+The projection must not re-run a second independent dedupe/ranking algorithm.
 
-## SearchResponse
+If the host wants labelled `provider -> position` provenance, capture that information during insertion in an auxiliary structure without changing the compatibility `positions` list used by scoring.
 
-    SearchResponse
-      query
-      results: bounded list[MergedResult]
-      providers: bounded provider diagnostics
-      degraded: boolean
-      elapsed_ms
+## Golden tests
 
-Do not return raw HTML, cookies, validation tokens, transport exceptions, or unbounded metadata.
+Test exact behavior for:
 
-## Text normalization
+- whitespace collapse of spaces/tabs/newlines;
+- 200/1200 character limits and word-boundary ellipsis;
+- content equal to title becomes empty;
+- non-string URL becomes empty;
+- missing scheme receives `http` through parsed-url replacement;
+- IDNA netloc beginning with `xn--` becomes Unicode;
+- query, fragment, port, `www`, trailing slash, and query order remain untouched;
+- engine is added to provenance during normalization;
+- first accepted main result gets position 1 regardless of skipped malformed/side-channel entries;
+- Bing legacy output normalizes to the same internal field semantics as typed provider output.
 
-**Observation:** The analyzed result path collapses runs of whitespace and trims both ends. Titles are bounded at approximately 200 characters; snippets/content are bounded at approximately 1,200 characters, with word-boundary truncation and an ellipsis. When snippet text equals the title, the snippet is cleared.
+## Deliberate host deviations
 
-**Recommendation:** Keep these limits configurable constants, apply them after HTML-to-text conversion, and test Unicode whitespace. Do not cut a UTF-8 byte sequence in the middle of a code point.
-
-Suggested V1 rules:
-
-1. Convert HTML nodes to text without interpreting text as markup after extraction.
-2. Replace repeated whitespace with one ordinary space.
-3. Strip leading/trailing whitespace.
-4. Reject empty titles.
-5. Truncate title and snippet by Unicode character count at word boundaries.
-6. Preserve the original text only in bounded, opt-in debug metadata.
-
-## URL normalization at result boundary
-
-The normalizer should:
-
-1. unwrap Google and Bing provider wrappers;
-2. parse the URL;
-3. require a scheme and network location;
-4. lowercase the hostname;
-5. normalize IDNA representation for identity;
-6. preserve a safe display form;
-7. remove no query parameters by default;
-8. calculate identity using the separate URL policy.
-
-The normalizer must not fetch the destination to discover canonical tags. Search and page fetching are separate capabilities.
-
-## Dates and thumbnails
-
-Published dates are optional. A provider date may be retained only when the parser can identify a real date field. Do not infer a publication date from arbitrary snippet prose in V1.
-
-Thumbnails are metadata, not evidence that the result URL is safe. Preserve a thumbnail URL only if it is absolute and within a bounded field length. Never fetch or render it inside the search subsystem.
-
-## Metadata policy
-
-Useful metadata includes:
-
-- provider-specific result type;
-- a redacted source marker;
-- a parser warning code;
-- an observed result feature such as “has thumbnail”.
-
-Do not preserve:
-
-- raw DOM fragments;
-- all provider attributes;
-- cookies;
-- query-bound validation tokens;
-- full wrapper URLs containing tracking data;
-- arbitrary script text.
-
-## Provider-local duplicate handling
-
-Before cross-provider merging, collapse repeated identical identities from the same provider. Keep the lowest provider position and, if necessary, merge the provider’s own fields. This prevents one provider from receiving an artificial consensus bonus for emitting the same destination twice.
-
-## Main results versus side channels
-
-The analyzed behavior also supports suggestions, answer boxes, infoboxes, engine data, and other result categories. Those are not required for V1 main web results. If added later, use a tagged union or separate arrays rather than allowing an answer object to masquerade as a normal web result.
-
-## Normalization examples
-
-Input:
-
-    title: "  A   useful   page "
-    snippet: "A useful page"
-    href: "https://example.test/a"
-    provider_position: 1
-
-Normalized:
-
-    title: "A useful page"
-    snippet: ""
-    url: "https://example.test/a"
-    provider_position: 1
-
-Input:
-
-    title: "Example"
-    href: "/url?q=https%3A%2F%2Fexample.test%2Fdocs&sa=U"
-
-Normalized:
-
-    title: "Example"
-    url: "https://example.test/docs"
+Absolute-URL enforcement, HTTP(S)-only output, ASCII-IDNA canonicalization, tracking removal, or richer provenance are reasonable Overmind boundaries, but they must be applied after/paralleling the compatibility model and covered by separate tests. They are not part of the observed normalization behavior.
