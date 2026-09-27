@@ -1,301 +1,331 @@
 # Test strategy
 
-## Test layers
+## Goal
+
+The test suite must prove that the embedded implementation reproduces the audited search behavior before any Overmind-specific hardening or projection is applied. Provider protocols are brittle, so exact request/parse fixtures matter more than broad mocked “returns some results” tests.
 
 Use five layers:
 
-1. Pure unit tests for mapping, identity, merge, and ranking.
-2. Sanitized fixture tests for provider parsers.
-3. Fake-transport tests for request construction and failure handling.
-4. Deterministic concurrency tests with controlled tasks.
-5. Optional live smoke tests that are never required for ordinary CI.
+1. pure compatibility unit tests;
+2. sanitized provider-response fixtures;
+3. fake transport/request-shape tests;
+4. concurrency/deadline/merge integration tests;
+5. optional low-rate live smoke tests.
 
-No test should depend on a real CAPTCHA, an external redirect, or an unbounded live response.
+## Common normalization golden tests
 
-## Unit tests: common models
+Assert exact behavior for:
 
-Cover:
+- spaces/tabs/newlines collapse to one space;
+- title limit 200 chars with final-word truncation plus `" …"`;
+- content limit 1200 chars with the same rule;
+- content identical to title becomes empty;
+- missing URL scheme receives `http` through common parsed-URL normalization;
+- IDNA netloc beginning `xn--` is decoded to Unicode;
+- query order, fragments, ports, `www`, and trailing slashes are retained;
+- provider engine enters the provenance set;
+- positions count only accepted main results, beginning at 1.
 
-- empty and whitespace-only query rejection;
-- limit lower and upper bounds;
-- one-based provider positions;
-- whitespace collapse;
-- title/snippet truncation at word boundaries;
-- duplicate title/snippet suppression;
-- absolute URL validation;
-- metadata bounds;
-- provider-local duplicate collapse;
-- labelled provenance observations.
+## Google golden tests
 
-## Unit tests: Google
-
-### Request construction
-
-Assert decoded parameter maps for:
-
-- first page;
-- page two offset 10;
-- each time range d, w, m, y;
-- safe off, moderate, strict;
-- locale en-US;
-- locale es-ES;
-- an all-locale request;
-- a Chinese locale alias;
-- omission of num;
-- presence of sca_esv, ie, and oe;
-- fixed Accept and consent cookie;
-- stable request-level browser profile;
-- redirect following disabled.
-
-### Response parser
-
-Fixtures should contain small sanitized blocks for:
-
-- two normal results;
-- missing title;
-- missing href;
-- a Google wrapper URL;
-- a direct absolute URL;
-- a snippet and an encrypted thumbnail;
-- malformed one-result block followed by a valid block;
-- XML declaration before HTML;
-- an empty but structurally valid result page.
-
-### Block detection
-
-Fixture or synthetic response tests for:
-
-- sorry.google.com final URL;
-- /sorry path;
-- HTTP 302 with challenge-like body;
-- short body containing /sorry/;
-- ordinary empty response that must not be misclassified without evidence.
-
-## Unit tests: Bing
-
-### Request construction
+### Request
 
 Assert:
 
-- q and adlt values;
-- setlang for en-US and es-ES;
-- cc for es;
-- cc omission for us, cn, and ru;
-- no unsupported time/page parameters are advertised;
-- optional market helper is not accidentally sent if the active contract does not use it.
+- endpoint `/wml/search`;
+- `q` and `sca_esv=1`;
+- `hl/lr/cr/ie/oe` trait output;
+- page 1 omits `start`; page 2 sends `start=10`;
+- `day/week/month/year -> qdr:d/w/m/y`;
+- safe 0 omits `safe` entirely;
+- safe 1 -> `medium`, safe 2 -> `high`;
+- `num` is absent;
+- User-Agent belongs to the exact Nokia set;
+- browser profile is `chrome99_android`;
+- online request redirects remain disabled;
+- generic `Accept-Language` shape is preserved;
+- do not assert helper-only `Accept: */*` or `CONSENT=YES+` as values actually applied by this web request.
 
-### Redirect decoding
+### CAPTCHA/sorry
 
 Test:
 
-- valid a1 base64url with missing padding;
-- valid payload containing query parameters;
-- valid UTF-8;
-- malformed base64;
-- invalid UTF-8 replaced safely;
-- wrapper without a1;
-- non-wrapper absolute URL;
-- decoded value that is not absolute.
+- host `sorry.google.com`;
+- path `/sorry...`;
+- HTTP 302;
+- body under 2000 chars containing `/sorry/`;
+- ordinary response not falsely classified.
 
-### Response parser
+### Parser
 
-Fixtures should include:
+Fixtures for:
 
-- normal b_results with multiple b_algo items;
-- missing h2 link;
-- missing href;
-- decorative algoSlug_icon span;
-- empty snippet;
-- malformed wrapper followed by a valid result;
-- challenge/login document with no result list.
+- XML declaration removal;
+- current result block/title/snippet/thumbnail selectors;
+- missing title -> item skip;
+- missing href -> item skip;
+- malformed block exception -> item skip, later block survives;
+- suggestions side channel;
+- `/url?q=` direct decode.
 
-## Unit tests: DuckDuckGo
+### URL unwrap
 
-### Request construction
+Golden test must prove order:
+
+    strip prefix -> split literal &sa=U -> percent-decode
+
+Do not add a provider-level absolute-URL assertion in the parity test.
+
+## Bing golden tests
+
+### Request
 
 Assert:
 
-- query length 499 accepted;
-- query length 500 rejected without network;
-- first-page POST fields q and b;
-- Content-Type;
-- stable User-Agent reused across page one and page two;
-- Sec-Fetch-* fields;
+- endpoint `/search`;
+- `q`;
+- `adlt=off/moderate/strict`;
+- `setlang` from trait region;
+- `cc` present for ordinary regions;
+- `cc` absent for `us`, `cn`, `ru`;
+- no `mkt` in ordinary web request;
+- page > 1 rejected by capability layer;
+- time filter rejected by capability layer;
+- provider network enables HTTP/3 when the transport conditions allow it.
+
+### Parser
+
+Fixtures for:
+
+- `ol#b_results > li.b_algo`;
+- missing link -> skip;
+- empty href/title -> skip;
+- paragraph extraction;
+- exact removal of `span.algoSlug_icon`;
+- direct href unchanged.
+
+### Wrapper decoding
+
+Test:
+
+- exact `https://www.bing.com/ck/a?` prefix;
+- missing `u` leaves wrapper href;
+- `u` without `a1` leaves wrapper href;
+- `a1` stripping;
+- URL-safe base64 padding;
+- UTF-8 decode with replacement;
+- no absolute-URL validation afterward;
+- malformed base64 exception escapes the parser and is classified at provider level, not silently skipped.
+
+### Empty page
+
+A successful HTTP page with zero matching `b_algo` blocks must produce an empty result list, not an invented ParseFailure.
+
+## Primary DuckDuckGo HTML golden tests
+
+### Request preprocessing
+
+Assert:
+
+- 499-char query accepted;
+- 500-char query produces no request;
+- recognized external bangs become quoted;
+- query whitespace is normalized by bang preprocessing;
+- process/provider User-Agent is stable across searches/pages.
+
+### First page
+
+Assert form/header state:
+
+- method POST;
+- HTML endpoint with trailing slash;
+- `q` and `b=""`;
+- no continuation fields;
+- exact Sec-Fetch navigation headers;
 - Referer;
-- kl region cookie;
-- df time cookie;
-- page two token fields;
-- offsets for pages 2, 3, and 4;
-- Chinese locale page-two suppression;
-- no tokenless continuation request.
+- form content type;
+- all-region `kl=wt-wt` with no `kl` cookie;
+- specific region `kl` in both form and cookie;
+- time filter `df` in both form and cookie;
+- no invented safe-search field.
 
-### Token state
+### Continuation
+
+Assert:
+
+- token cache key depends on transformed query + exact User-Agent;
+- token TTL 3600 seconds;
+- missing token raises the CAPTCHA/access-denied type with zero suspension;
+- locale starting `zh` produces no page>1 request;
+- `nextParams`, `api=d.js`, `o=json`, `v=l`, `vqd`;
+- offsets page2=10, page3=25, page4=40;
+- `dc=s+1`.
+
+### Parser
+
+Assert:
+
+- 303 -> empty result list;
+- `form#challenge-form` -> CAPTCHA/access-denied with zero suspension;
+- hidden `vqd` extraction/cache;
+- exact `div#links > div.web-result` selection;
+- ads not selected;
+- title/href/snippet extraction;
+- structurally missing indexed href can escalate to provider-level failure;
+- zero-click answer emitted only when not matching diagnostic phrases.
+
+## Secondary DuckDuckGo JSON/script golden tests
+
+This adapter is optional for V1 but its documentation is complete enough to implement later. Test:
+
+- first-page discovery GET;
+- Firefox impersonation;
+- `default_headers=false`;
+- `deep_preload_link` extraction;
+- first-page URL cache TTL 7200 seconds;
+- insertion of `o=json` into `d.js` URL;
+- exact script/no-cors/same-site headers;
+- JSON fields `u/t/a`;
+- item without `u` skipped;
+- continuation `n` builds next page URL;
+- next-page cache TTL 3600 seconds;
+- direct page skipping fails without a cached next-page URL;
+- narrow arithmetic challenge fixture reproduces the audited calculation/follow-up without a general JS evaluator.
+
+## URL identity/dedup golden tests
+
+Assert parity identity fields:
+
+    template + netloc + path + params + query + fragment + img_src
+
+and verify:
+
+- scheme difference alone merges;
+- `www` difference does not merge;
+- different query order does not merge;
+- different fragment does not merge;
+- trailing slash difference does not merge;
+- `img_src` difference does not merge;
+- thumbnail difference alone does not necessarily split identity;
+- same-provider duplicate uses the same global merge path and appends a second position;
+- no tracking-parameter removal;
+- no provider-local pre-dedup.
+
+If implementation replaces Python integer-hash keys with structured keys for collision safety, run all ordinary equivalence cases against both models and mark the key representation as a deliberate internal safety deviation.
+
+## Merge/ranking golden tests
+
+Test exact field merge:
+
+- longer title wins;
+- longer content wins;
+- empty/default fields are filled according to model semantics;
+- provider provenance unions;
+- secure-suffixed scheme can replace insecure scheme;
+- every duplicate appends position.
+
+Test exact score:
+
+    product(engine weights)
+    * len(positions)
+    * sum(1/position)
+
+for ordinary priority.
+
+Include:
+
+- one engine;
+- two engines;
+- three engines;
+- non-1.0 weights;
+- duplicate occurrences from the same engine;
+- low priority;
+- high priority.
+
+Golden R1/R2 example with equal weights must remain:
+
+    R1 = 5.5
+    R2 = 3.0
+
+## Final grouping golden tests
+
+After score sorting, test the second pass using:
+
+    group key = category + template + image marker
+    max_count = 8
+    max_distance = 20
+
+Verify that:
+
+- grouping can change score order;
+- image-bearing and non-image groups differ;
+- primary/origin `engine` determines category lookup;
+- equal-score first-pass order remains stable/insertion-based;
+- no synthetic tie-break is introduced in parity mode.
+
+## Concurrency/deadline tests
+
+Use controllable fake providers to verify:
+
+- all eligible providers start before joins/waits;
+- shared deadline is not multiplied by provider count;
+- one provider failure preserves siblings;
+- one provider timeout preserves fast successes;
+- late result is rejected;
+- search start is common to all network budgets;
+- extra provider network calls see less remaining time;
+- suspended provider is skipped pre-dispatch;
+- success resets suspended state;
+- changing completion order can change only behaviors that are insertion-order-dependent (for example exact-score ties), not score computation itself.
+
+## Failure/suspension tests
+
+Assert active configured behavior:
+
+- generic immediate failure suspension: 5 s;
+- access denied: 180 s;
+- CAPTCHA: 3600 s;
+- too many requests: 180 s;
+- Cloudflare CAPTCHA: 1,296,000 s;
+- Cloudflare firewall: 86,400 s;
+- reCAPTCHA: 604,800 s;
+- primary DuckDuckGo missing-vqd/challenge: explicit 0 s.
+
+Also test generic HTTP mappings for 402/403/429 and recognized challenge signatures.
+
+## Transport fingerprint tests
 
 Test:
 
-- token extraction from hidden vqd input;
-- token cache hit for the same query/User-Agent;
-- cache miss for a different query;
-- cache miss for a different User-Agent;
-- TTL expiry;
-- invalid token clearing after a challenge;
-- concurrent access to the same state key;
-- no token value in telemetry.
-
-### Response parser
-
-Fixtures should include:
-
-- normal web-result blocks;
-- ad-style block excluded;
-- missing title;
-- missing snippet;
-- direct destination href;
-- challenge-form;
-- 303 response;
-- vqd hidden input;
-- optional zero-click abstract;
-- diagnostic zero-click text excluded.
-
-## Locale and filter tests
-
-Use a table-driven suite:
-
-| Input | Expected behavior |
-| --- | --- |
-| no locale | provider fallback |
-| en-US | provider-specific English/US values |
-| es-ES | provider-specific Spanish/Spain values |
-| zh-CN | provider alias values |
-| unsupported language | fallback or UnsupportedLocale according to policy |
-| safe off | provider off mapping |
-| safe strict | provider strict mapping or explicit unsupported outcome |
-| time day/week/month/year | provider-specific values |
-| Bing time filter | UnsupportedCapability in V1 |
-
-## Canonical URL and deduplication tests
-
-Test:
-
-- Google wrapper versus direct destination;
-- Bing wrapper versus direct destination;
-- HTTP versus HTTPS under the selected policy;
-- host case;
-- default ports;
-- non-default ports;
-- www distinction;
-- root and non-root trailing slashes;
-- repeated slashes;
-- encoded slash versus literal slash;
-- query order;
-- unknown query parameter preservation;
-- allowlisted tracking parameter policy if later enabled;
-- fragments preserved by default;
-- userinfo rejection;
-- IDNA host normalization;
-- hash collision simulation with explicit identity comparison.
-
-## Merge and ranking tests
-
-Test:
-
-- one provider result;
-- same destination from two providers;
-- same destination from all providers;
-- different titles and snippets;
-- HTTPS preference;
-- labelled positions;
-- conflicting dates;
-- provider-local duplicate collapse;
-- deterministic tie-break;
-- observed score compatibility formula;
-- recommended simplified formula;
-- consensus cap;
-- a provider cannot obtain multiple consensus bonuses from duplicate blocks.
-
-The worked R1/R2 example in 11_MERGE_AND_RANKING.md should be a golden test with expected scores 5.5 and 3.0 for equal provider weights under the observed formula.
-
-## Concurrency tests
-
-Use fake providers with barriers and controllable delays:
-
-- all providers succeed;
-- one fails immediately;
-- two fail;
-- one times out;
-- all time out;
-- slow success before the deadline;
-- completion after the deadline;
-- cancellation requested at deadline;
-- a task raises an unexpected exception;
-- completion order changes but final order does not;
-- late task cannot mutate a completed response.
-
-## Fixture design
-
-Fixtures must be:
-
-- small;
-- sanitized;
-- stored by provider and protocol case;
-- free of real cookies, tokens, personal data, and large tracking URLs;
-- representative of the external document structure;
-- accompanied by the failure or behavior the fixture proves.
-
-Do not copy entire provider pages. A handful of result blocks and the surrounding container is sufficient.
-
-## Regression tests for brittle selectors
-
-Every provider parser should have:
-
-- a fixture for the currently observed selector structure;
-- a fixture with unrelated navigation/advertising elements;
-- a missing-field fixture;
-- a zero-result or block fixture;
-- an assertion that a structural change produces ParseFailure or an explicit warning rather than silently returning plausible but wrong data.
-
-Add a test that checks the parser’s result count is not zero solely because a fixture contains no expected selector.
-
-## Transport tests
-
-With a fake server or mocked transport, test:
-
-- GET query encoding;
-- POST form encoding;
-- header and cookie isolation;
-- compressed response decoding;
-- body-size limit;
-- invalid encoding;
-- redirect budget;
-- TLS error classification;
-- retry count and deadline propagation;
-- HTTP/2/HTTP/3 profile selection as a configuration decision;
-- client reuse and close.
+- default Chrome impersonation;
+- Google `chrome99_android` + Nokia UA;
+- Bing conditional HTTP/3;
+- primary DDG stable explicit UA plus default browser transport;
+- secondary DDG Firefox + no default headers;
+- redirects disabled through online-provider params;
+- `discard_cookies=true` behavior represented by explicit provider cookies;
+- disconnected pooled connection special retry;
+- configured generic retries=0;
+- shrinking timeout from one search start.
 
 ## Optional live smoke tests
 
-Run periodically, outside mandatory unit CI, from a controlled environment:
+Run low-rate, manually enabled tests from the intended deployment egress. For each provider:
 
-- one short benign query per provider;
-- verify status and at least one structurally valid result;
-- verify wrapper decoding;
-- verify locale and safe-search request construction;
-- record elapsed time and parser warnings;
-- never solve or repeatedly trigger challenges;
-- stop or back off when a block/CAPTCHA is detected.
+- one benign short query;
+- record status, body size, content type, elapsed time;
+- verify expected request/profile and structural selector;
+- verify at least one result when the query should obviously return results;
+- stop/back off on block/challenge;
+- never make live availability a mandatory unit-CI gate.
 
-Live tests should be rate-limited, manually enabled in CI, and must not fail a code change solely because a public provider is temporarily unavailable.
+Live tests detect protocol drift; sanitized fixtures define implementation behavior.
 
-## Property and fuzz testing
+## Clean separation of host hardening
 
-Useful properties:
+Maintain two test groups:
 
-- URL identity is deterministic;
-- identity does not contain raw cookies or tokens;
-- wrapper decoding never performs I/O;
-- malformed base64 never crashes the coordinator;
-- parser output is bounded;
-- ranking is deterministic under provider completion permutation;
-- a provider failure does not remove another provider’s results.
+    parity/*
+    host_policy/*
 
-Fuzz HTML fragments, URL query strings, Unicode whitespace, invalid UTF-8, and truncated wrapper values.
+Examples of host policy: body caps, HTTP(S)-only agent output, richer labelled provenance, cancellation improvements. A host-policy test must not replace or silently weaken the parity golden tests.
