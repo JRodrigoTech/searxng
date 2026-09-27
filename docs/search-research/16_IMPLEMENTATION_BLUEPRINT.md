@@ -2,99 +2,119 @@
 
 ## Objective
 
-Build a small self-contained Python search package for an existing AI runtime. The package must reproduce the audited behavior of three web providers—Google, Bing, and the primary DuckDuckGo HTML path—then expose the merged/ranked results through one tool call.
+Build a small self-contained Python search capability for an existing AI runtime. The package must reproduce the audited behavior of three web providers—Google, Bing, and the primary DuckDuckGo HTML path—then expose merged/ranked results through one Tool call.
 
-The package is independent in naming and structure, but its provider request, parsing, normalization, deduplication, merge, ranking, deadline, and failure semantics are compatibility requirements.
+This blueprint distinguishes two layers:
 
-## Proposed package shape
+- **V0 implementation path** — first-page, all-locale, no-time, no-safe-control, bounded `web.search(query, limit)` integrated into the current synchronous Overmind Tool contract.
+- **Full compatibility reference** — the broader documented behavior covering locale traits, paging, DDG continuation, safe/time capability handling, and related state.
 
-    search/
+For the first coding pass, `18_SIMPLIFIED_V0_CONTRACT.md` is normative for feature scope and this document supplies package/build guidance.
+
+## Recommended Overmind package shape
+
+    overmind/tools/web_search/
         __init__.py
+        tool.py
         models.py
         coordinator.py
         transport.py
-        traits.py
-        state.py
         normalize.py
-        identity.py
         aggregate.py
         errors.py
-        telemetry.py
         providers/
             __init__.py
-            base.py
             google.py
             bing.py
             duckduckgo.py
-            # optional later:
-            duckduckgo_json.py
 
-Names are generic and project-owned. Do not mirror a larger application's internal module/class hierarchy.
+Full-reference-only additions may later include:
 
-## Public tool API
+    traits.py
+    state.py
+    providers/duckduckgo_json.py
 
-Conceptual API:
+Do not create a server, daemon, Docker service, browser process, generic crawler, or separate application framework.
 
-    async search(
-        query: str,
-        *,
-        limit: int = 10,
-        locale: str = "all",
-        safe_search: int = 0,
-        time_range: str | None = None,
-        page: int = 1,
-        timeout: float | None = None,
-    ) -> SearchResponse
+## V0 public Tool API
 
-Suggested accepted values:
+The current Overmind Tool contract is synchronous. V0 therefore exposes conceptually:
 
-    safe_search: 0 | 1 | 2
-    time_range: None | "day" | "week" | "month" | "year"
-    page: one-based
+    WebSearchTool.execute(
+        {
+            "query": str,
+            "limit": int = 10,
+        },
+        cancellation=...
+    ) -> dict
 
-The public API should not expose raw provider query parameters or cookies.
+Tool identity:
 
-## Compatibility mode is the default implementation target
+    component_identity = "tools/web_search"
+    name = "web.search"
 
-The first implementation should have one behavior mode only: compatibility. Avoid shipping a parallel “improved” ranking/URL-normalization path until the parity suite passes.
+Public V0 arguments are only:
 
-Host hardening can exist at explicit boundaries, for example:
+    query
+    limit
 
-    provider parity pipeline
-       -> agent-output URL policy
-       -> tool serialization
+Fixed internal behavior:
 
-Do not mix those concerns inside provider parsers or ranking.
+    page = 1
+    locale = "all"
+    safe_search = 0
+    time_range = None
+    shared_timeout = 3.0
+    provider weights = 1.0
+
+The model must not be allowed to send raw provider parameters, cookies, provider names, browser profiles, page numbers, locale values, or time/safe fields in V0.
+
+## Full compatibility API is later work
+
+A later internal/full API may conceptually support:
+
+    search(
+        query,
+        limit,
+        locale,
+        safe_search,
+        time_range,
+        page,
+        timeout_limit,
+    )
+
+but do not implement/expose that surface merely because the compatibility documentation describes it. V0 deliberately avoids traits, Babel, DDG continuation requirements, and extra caller-controlled capability gates.
 
 ## Internal models
 
 ### SearchRequest
 
+V0 fields:
+
     query
     limit
-    locale
-    safe_search
-    time_range
-    page
-    timeout_limit
+
+Internal constants supply the fixed V0 profile.
 
 ### PreparedRequest
+
+Recommended fields:
 
     provider
     method
     url
     headers
     cookies
-    form/data
-    json/content
+    query_params
+    form_data
     allow_redirects
     browser_profile
     default_headers
-    network flags
+    prefer_http3
 
 ### ProviderMainResult
 
-Use fields sufficient to reproduce common normalization/identity:
+Fields sufficient for parity behavior:
 
     url
     parsed_url
@@ -102,9 +122,20 @@ Use fields sufficient to reproduce common normalization/identity:
     content
     thumbnail
     img_src
-    provider/engine
+    provider
     template
     priority
+    category
+
+Defaults for ordinary V0 results:
+
+    template = "default.html"
+    priority = ""
+    category = "general"
+    img_src = ""
+    thumbnail = ""
+
+Keep `thumbnail` and `img_src` separate. Ordinary identity uses `img_src`; final grouping considers image presence.
 
 ### AggregatedResult
 
@@ -115,14 +146,24 @@ Use fields sufficient to reproduce common normalization/identity:
     thumbnail
     img_src
     primary_provider
-    providers: set
-    positions: list[int]
+    providers
+    positions
     template
     category
     priority
     score
 
-Optionally retain an auxiliary labelled observation list for telemetry/explainability, but do not replace the compatibility `positions` list used by scoring.
+### ProviderDiagnostic
+
+At minimum:
+
+    provider
+    status
+    result_count
+    elapsed_ms
+    reason_code
+
+Do not place raw bodies, cookies, tokens, full request URLs, or arbitrary exception reprs here.
 
 ### SearchResponse
 
@@ -133,28 +174,30 @@ Agent-facing projection:
     provider_diagnostics
     elapsed_ms
 
-Each result may expose:
-
-    title
-    url
-    snippet
-    score
-    providers
-    positions
-    thumbnail
-
-All provider text remains untrusted data.
-
 ## Module responsibilities
+
+### `tool.py`
+
+Owns only:
+
+- canonical Tool metadata/schema;
+- public argument validation;
+- cancellation check before execution;
+- delegation to the coordinator;
+- bounded JSON-serializable observation projection;
+- optional low-cardinality event metadata.
+
+Must not know provider selectors, cookies, ranking internals, or HTTP endpoints.
 
 ### `providers/google.py`
 
-Must own:
+V0 owns:
 
 - WML endpoint;
-- locale query mappings;
-- exact safe/time/page parameter conditions;
+- fixed all-locale request values from `18`;
+- exact safe=0 omission;
 - fixed Nokia User-Agent set;
+- per-request random Nokia UA selection;
 - `chrome99_android` profile;
 - Google-sorry detection;
 - XML-declaration removal;
@@ -162,243 +205,286 @@ Must own:
 - exact `/url?q=` split-before-unquote decoder;
 - per-result exception isolation.
 
-Must not own global dedupe/ranking.
+Full locale/time/page support belongs to later/full compatibility work.
 
 ### `providers/bing.py`
 
-Must own:
+V0 owns:
 
 - `/search` endpoint;
-- `q/adlt/setlang/cc` mapping;
-- no `mkt` for the ordinary web path;
+- `q` and `adlt=off` request shape;
+- omission of `setlang`, `cc`, and `mkt` under fixed all-locale V0;
 - exact result selectors;
-- decorative icon removal;
+- exact decorative icon removal;
 - exact `ck/a?u=a1...` decoder;
-- the fact that malformed recognized base64 can fail the provider;
-- HTTP/3 provider transport flag.
+- provider-level failure when a recognized malformed wrapper raises;
+- provider transport preference for HTTP/3 when supported.
 
-Must not invent pagination/time support.
+Do not invent paging/time support.
 
 ### `providers/duckduckgo.py`
 
-Must own:
+V0 owns:
 
-- query-length guard;
-- external-bang quoting/whitespace behavior;
-- stable generated User-Agent;
+- query max-length guard;
+- provider-specific whitespace collapse;
+- public bang syntax rejection occurs in Tool validation, so no external bang table is required;
+- stable Firefox-formatted generated User-Agent from exact OS/version corpus;
 - HTML POST endpoint;
 - exact Sec-Fetch/Referer/content-type headers;
-- `kl` region form/cookie behavior;
-- `df` time form/cookie behavior;
-- first-page `b` field;
-- continuation `vqd/nextParams/api/o/v/s/dc` fields;
-- `vqd` state keyed by transformed query + UA, TTL 3600;
-- Chinese continuation suppression;
-- 303 empty behavior;
-- `challenge-form` CAPTCHA behavior with zero suspension;
-- exact result and zero-click selectors.
+- fixed `kl=wt-wt` all-locale form value;
+- first-page empty `b` field;
+- 303 healthy-empty behavior;
+- challenge-form failure with zero explicit suspension;
+- exact result selectors;
+- hidden `vqd` capture/cache may be retained even though V0 does not consume it.
 
-Do not add an unverified safe-search field.
-
-### optional `providers/duckduckgo_json.py`
-
-Only after primary V1 parity passes. It may implement the separately documented preload-link/JSON path, including Firefox profile, page URL cache, sequential pagination, and narrow arithmetic challenge behavior.
+Later/full compatibility may add exact continuation fields and persistent TTL state.
 
 ### `transport.py`
 
-Compatibility baseline: `curl_cffi` async clients.
+V0 compatibility baseline:
+
+    curl_cffi
 
 Must support:
 
 - provider-specific impersonation;
-- explicit default-header enable/disable;
-- HTTP/2 and conditional HTTP/3;
+- explicit headers/cookies;
 - TLS verification;
-- pooled clients keyed by material transport settings;
-- explicit cookies with no accidental jar carryover;
-- redirects disabled for ordinary provider calls;
+- redirects disabled for ordinary provider requests;
 - common HTTP error classification;
-- one shared remaining-time budget.
+- timeout based on remaining shared deadline;
+- optional HTTP/3 preference for Bing;
+- no accidental cross-provider cookie/session state.
 
-### `traits.py`
+A narrow synchronous wrapper is preferred for V0 because Overmind's Tool contract is synchronous and the compatibility semantics are naturally expressed with provider worker threads.
 
-Must provide equivalent Google/Bing/DDG provider mappings from a generated snapshot and best-fit locale logic. Broad locale support requires more than splitting BCP-47 strings.
-
-Trait refresh is optional tooling, not a per-query dependency.
-
-### `state.py`
-
-Must provide provider-scoped TTL state with safe concurrent access.
-
-For primary DDG:
-
-    secret/query-UA key -> vqd, 3600 s
-
-If persistence is omitted in favor of process memory, record that as an explicit implementation deviation.
+Do not make `httpx` the provider transport if doing so loses Google browser impersonation parity.
 
 ### `normalize.py`
 
-Must reproduce:
+Must reproduce exactly:
 
-- exact whitespace collapse;
+- whitespace collapse;
 - title/content limits 200/1200;
-- word-boundary ellipsis;
-- content==title clearing;
+- word-boundary ellipsis behavior;
+- normalized content==title clearing;
 - parsed URL construction;
-- missing-scheme `http` behavior;
-- observed IDNA conversion.
-
-### `identity.py`
-
-Must reproduce ordinary identity fields:
-
-    template
-    netloc
-    path
-    params
-    query
-    fragment
-    img_src
-
-Scheme is excluded.
-
-A structured tuple/string can replace a raw Python integer hash for collision safety only if documented as an internal deviation that produces identical ordinary-case equivalence.
+- missing-scheme default to `http`;
+- observed IDNA conversion behavior.
 
 ### `aggregate.py`
 
-Must reproduce:
+May contain both identity and aggregation logic for V0. Must reproduce:
 
 - provider-local accepted position assignment;
-- global duplicate merge (including same-provider duplicates);
+- ordinary identity fields:
+
+      template
+      netloc
+      path
+      params
+      query
+      fragment
+      img_src
+
+- scheme exclusion from identity;
+- global duplicate merge including same-provider duplicates;
 - longer title/content selection;
 - provenance union;
 - secure-suffixed scheme preference;
+- appended positions;
 - exact score formula;
-- score-descending stable sort;
+- stable score-descending sort;
 - exact second grouping pass with `max_count=8`, `max_distance=20`.
 
 Do not pre-collapse same-provider duplicates.
 
+For collision safety, a structured identity tuple may replace raw Python integer-hash storage only as the documented internal deviation. The identity fields themselves must remain exact.
+
 ### `coordinator.py`
 
-Must:
+V0 must:
 
-1. record search start;
-2. resolve eligible providers;
-3. skip suspended/unsupported providers;
-4. derive one shared timeout;
-5. start all eligible providers concurrently;
-6. accept only results completed before the deadline;
-7. isolate provider failures;
-8. normalize/merge in accepted provider completion order for parity-sensitive ties;
-9. close/score/order;
-10. apply the final caller result limit;
-11. project results through any explicit host output policy.
+1. validate cancellation before dispatch;
+2. record `start = monotonic()`;
+3. establish one shared deadline `start + 3.0`;
+4. filter temporarily suspended providers;
+5. construct all provider workers;
+6. start all eligible workers before waiting for any one of them;
+7. poll/join with short bounded waits so Overmind cancellation remains responsive;
+8. isolate provider failure;
+9. reject all provider completion after deadline/cancellation admission closes;
+10. normalize and merge only accepted outputs;
+11. score and group;
+12. apply caller `limit` only after ordering/grouping;
+13. return bounded provider diagnostics.
 
-A native asyncio coordinator is preferred; it need not reproduce source worker threads internally.
+Recommended V0 execution model: one synchronous coordinator plus worker threads around synchronous provider HTTP calls.
+
+Do not create a new asyncio event loop per Tool call. A future async Tool runtime can replace the coordinator internals without changing provider/aggregate contracts.
+
+## Healthy-empty versus failure
+
+This distinction is mandatory.
+
+Examples of healthy-empty:
+
+- provider returns a valid page with zero ordinary results;
+- primary DuckDuckGo returns HTTP 303 according to its documented adapter behavior.
+
+Healthy-empty still counts as a completed provider, not a failed provider.
+
+`SEARCH_UNAVAILABLE` should describe the case in which every eligible provider is failed, timed out, or suspended. If every provider completes successfully but returns zero results, return:
+
+    ok = true
+    results = []
 
 ## Provider capability matrix
 
+### V0
+
 | Capability | Google | Bing | Primary DuckDuckGo |
 | --- | --- | --- | --- |
-| First page | yes | yes | yes |
+| Page 1 | yes | yes | yes |
+| All-locale fixed mode | yes | yes | yes |
+| Caller paging | no | no | no |
+| Caller time filter | no | no | no |
+| Caller safe setting | no | no | no |
+| Arbitrary fetch | no | no | no |
+
+### Full-reference behavior documented for later
+
+| Capability | Google | Bing | Primary DuckDuckGo |
+| --- | --- | --- | --- |
 | Later pages | yes, max 50 | no | yes with cached state |
 | Time filter | yes | no | yes |
-| Safe capability | yes | yes | advertised, no explicit request mapping in audited HTML builder |
+| Safe capability | yes | yes | advertised but no explicit request mapping in audited HTML builder |
 | Locale | language + region traits | region traits | region traits + Accept-Language |
-| JS runtime | no | no | no |
 
-The coordinator should mimic the common capability gate: when a global requested option is unsupported, that provider is skipped rather than receiving invented parameters.
+## Exact V0 call sequence
 
-## End-to-end call sequence
-
-    ToolRegistry / authorized search call
+    authorized Tool call web.search
         |
         v
-    SearchRequest validation
+    validate query + limit + unsupported bang syntax
         |
         v
-    search_start + actual_timeout
+    cancellation check
         |
         v
-    capability / suspension filter
+    search_start + 3.0 s shared deadline
         |
         v
-    launch eligible provider tasks concurrently
+    provider suspension filter
+        |
+        v
+    start all eligible worker threads
         |
         +--> Google request -> parse
         +--> Bing request -> parse
-        +--> DDG HTML request -> parse/state update
+        +--> DDG HTML request -> parse/capture optional vqd
         |
         v
-    accept only in-deadline provider outputs
+    accept only in-deadline, non-cancelled provider outputs
         |
         v
-    common normalization
+    exact common normalization
         |
         v
-    global identity merge in insertion order
+    global identity merge in accepted insertion order
         |
         v
-    score on close
+    exact score calculation
         |
         v
-    score sort + category/template/image grouping
+    stable score sort + exact grouping pass
         |
         v
-    final result limit
+    apply final caller limit
         |
         v
-    host output URL/security policy
-        |
-        v
-    bounded SearchResponse -> agent
+    bounded Tool observation
+
+## Overmind integration points
+
+The coding agent must update existing ownership locations rather than invent search-specific infrastructure:
+
+- `overmind/extensions/builtin.py` — built-in Tool descriptor/factory;
+- `overmind/runtime_stargate/production_policy.py` — exact first-party grant `("tools/web_search", "web.search")`;
+- runtime dependency input/manifest/lock surfaces;
+- CI dependency installation where explicitly enumerated;
+- Tool/RuntimeStargate tests.
+
+The Tool must not receive Runtime, Agent, Session, ContextCompiler, RuntimeStargate, registries, or service locators.
+
+## Dependencies
+
+V0 direct additions:
+
+    curl_cffi
+    lxml
+
+Do not add Babel for fixed all-locale V0.
+
+Use the target repository's established reproducible dependency workflow to update all packaging/lock surfaces. Do not hand-edit generated lock material when a regeneration command exists.
 
 ## Recommended construction order
 
-1. models + parity fixtures;
-2. curl transport and deadline tests;
-3. common text/URL normalization;
-4. identity + merge + exact rank/grouping;
-5. trait snapshot/best-fit mapping;
-6. Google adapter;
-7. Bing adapter;
-8. primary DDG first-page adapter;
-9. DDG token state + continuation;
-10. coordinator/partial failures/suspension;
-11. agent-facing serialization and host policy;
-12. optional live smoke tests;
-13. optional secondary DDG adapter.
+1. read `18`, `19`, `20`, `21`;
+2. write deterministic tests first;
+3. models;
+4. normalization;
+5. identity/merge/rank/grouping;
+6. common HTTP error classification;
+7. narrow curl transport;
+8. Google adapter;
+9. Bing adapter;
+10. primary DDG page-one adapter;
+11. coordinator/deadline/cancellation;
+12. Tool wrapper;
+13. built-in registration + RuntimeStargate policy;
+14. dependency closure/packaging updates;
+15. optional live smoke tests;
+16. final compatibility audit from `21_IMPLEMENTATION_DRY_RUN.md`.
 
-This order lets the core aggregation semantics be validated independently from volatile live provider HTML.
+## Definition of V0 implementation parity
 
-## Definition of implementation parity
+V0 is not ready merely because it returns links. It must pass tests for:
 
-The implementation is not considered ready merely because all three providers return links. It must pass golden tests for:
-
-- exact provider request parameters and fingerprints;
+- exact V0 provider request parameters and fingerprints;
 - exact parser selectors/error granularity;
 - common normalization;
 - URL identity;
 - duplicate merge;
 - same-provider duplicate behavior;
 - exact score formula;
-- final grouping pass;
-- shared deadline/late-result rejection;
-- suspension behavior;
-- trait mapping for tested locales.
+- exact final grouping pass;
+- one shared deadline;
+- late-result rejection;
+- cancellation;
+- provider failure isolation and healthy-empty semantics;
+- exact Overmind Tool registration/authorization;
+- dependency closure in developer/CI/portable runtime.
 
-## Non-goals
+## Non-goals for V0
 
-Do not add in V1:
+Do not add:
 
 - a server/UI;
 - arbitrary page fetching;
+- locale selector;
+- paging selector;
+- time filter;
+- safe-search selector;
+- external bang dataset;
 - a search index;
 - generic crawling;
 - browser automation;
-- a general JavaScript runtime;
-- provider auto-discovery;
-- alternative ranking hidden behind the default path.
+- JavaScript runtime;
+- generic provider plugin framework;
+- alternative ranking;
+- secondary DDG adapter.
 
-The implementation should be small, embedded, and testable while preserving the mechanics that make the audited providers work.
+The V0 implementation should remain small, embedded, bounded, and testable while preserving the search mechanics that matter.
