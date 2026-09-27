@@ -1,179 +1,193 @@
 # URL identity and duplicate detection
 
-## Separate identity from display
+## Compatibility target
 
-The system needs two related but different values:
+Duplicate detection is intentionally simple and must be documented exactly because it directly affects consensus and ranking.
 
-- display_url — the destination presented to the caller;
-- canonical_identity — a stable key used only to decide whether two results represent the same destination.
+The audited implementation does **not** build a sophisticated canonical URL string. It normalizes result fields first, then uses the result object's Python hash as the dictionary key for duplicate merging.
 
-The display URL should preserve useful user-facing information. The identity key may normalize host case, default ports, or provider wrappers without rewriting the display URL.
+## Main-result identity
 
-## Observed identity behavior
+For ordinary typed web results, the hash input is equivalent to concatenating:
 
-**Observation:** The analyzed result merge key is built from a result template, parsed network location, path, parameters, query, fragment, and image-source value. The URL scheme is not included. The key is used directly in a dictionary.
+    template
+    parsed_url.netloc
+    parsed_url.path
+    parsed_url.params
+    parsed_url.query
+    parsed_url.fragment
+    img_src
 
-Consequences:
+The URL **scheme is omitted** from identity.
 
-- http and https versions of the same host/path/query merge;
-- host case is not independently normalized by this key;
-- default ports are not removed;
-- www and non-www remain different;
-- trailing slashes remain different;
-- repeated slashes remain different;
-- query parameter ordering remains different;
-- tracking parameters remain part of identity;
-- fragments remain part of identity;
-- different image sources can make otherwise equal image-style results distinct;
-- the dictionary key does not perform a second explicit equality check.
+Legacy ordinary web results use the same identity fields.
 
-This is an implementation observation, not the recommended long-term identity policy.
+Therefore two ordinary results merge when these identity components produce the same Python hash, even if their URL schemes differ.
 
-## Recommended conservative identity policy
+## What is and is not normalized before identity
 
-The V1 identity function should be explicit and collision-resistant:
+Common result normalization occurs before hashing. Relevant behavior is:
 
-    canonical_identity(url, policy) -> string
+- a missing scheme is replaced with `http` in the parsed URL;
+- an IDNA netloc beginning with `xn--` is decoded to Unicode;
+- title/content normalization does not participate in identity;
+- scheme does not participate in the main-result hash;
+- netloc does participate;
+- path participates;
+- URL params participate;
+- query participates exactly as parsed;
+- fragment participates;
+- `img_src` participates;
+- `thumbnail` does **not** participate;
+- `template` participates.
 
-### Parsing
+There is no generic removal of:
 
-Reject:
+- `www.`;
+- default ports;
+- tracking parameters;
+- trailing slashes;
+- repeated slashes;
+- fragments;
+- reordered query parameters.
 
-- missing scheme;
-- missing hostname;
-- control characters;
-- unsupported schemes;
-- invalid port syntax.
+There is no generic lowercase-host rewrite in the result identity layer.
 
-Accept only HTTP and HTTPS for ordinary web results. Preserve non-standard schemes as a typed invalid-result condition rather than attempting to fetch them.
+## Consequences
 
-### Authority
+### HTTP and HTTPS
 
-- Lowercase the hostname.
-- Convert Unicode hostnames to their IDNA ASCII form for identity.
-- Remove the default port 80 for http and 443 for https.
-- Preserve non-default ports.
-- Preserve the distinction between www.example.test and example.test.
-- Preserve userinfo only by rejecting it for a normal search result; userinfo in a result URL is not useful and can create credential leakage.
+These can merge when all other identity fields match because scheme is excluded.
 
-### Scheme
+    http://example.test/a
+    https://example.test/a
 
-For the observed interoperability requirement, http and https may share an identity when authority, path, query, and fragment otherwise match. Do not equate either with another scheme.
+can therefore be duplicates.
 
-This policy has a trade-off: an HTTP resource and an HTTPS resource can differ in content or access policy. If the caller requires security-sensitive separation, make scheme-sensitive identity a configuration option. The display merge policy should prefer https when the two values are otherwise equal.
+### Query ordering
 
-### Path
+These remain distinct:
 
-- Preserve path case.
-- Preserve repeated slashes.
-- Preserve encoded slash versus literal slash.
-- Normalize an empty path to / only when the URL parser requires it.
-- Do not remove a trailing slash from a non-root path.
-- Do not resolve dot segments unless a standards-tested URL library is used and the product accepts the semantic risk.
+    https://example.test/?a=1&b=2
+    https://example.test/?b=2&a=1
 
-### Percent encoding
-
-- Normalize hexadecimal case in percent escapes if the URL library provides a safe operation.
-- Decode only unreserved characters for identity.
-- Keep encoded reserved characters such as %2F distinct from literal slash.
-- Never decode arbitrary query values before comparison.
-
-### Query
-
-V1 should retain query parameter names, values, and order after syntactic encoding normalization. This is the safest rule because parameters can be order-sensitive and many are semantic.
-
-Tracking-parameter removal is a later, allowlisted policy, not a generic “drop everything that looks like tracking” rule. If enabled, begin with parameters that are unambiguously analytics-only, apply it only to known HTTP hosts, and keep both pre- and post-cleaning identities available for debugging.
-
-Do not remove:
-
-- q, query, id, item, page, p, path, version, or other content selectors;
-- unknown parameters;
-- signed or opaque parameters;
-- parameters on hosts that have not been tested.
+because the query string is part of identity as parsed.
 
 ### Fragment
 
-Keep fragments by default for conservative identity because a fragment can identify a document section or a client-side route. A page-identity mode may drop fragments when the product explicitly treats all anchors as one page. The mode must be tested separately.
+These remain distinct:
 
-## Provider wrapper removal
+    https://example.test/docs#one
+    https://example.test/docs#two
 
-Unwrap before identity:
+### `www`
 
-| Provider | Wrapper |
-| --- | --- |
-| Google | Relative /url?q= link; URL-decode and stop before &sa=U |
-| Bing | ck/a wrapper; read u, remove a1, pad, URL-safe base64-decode |
-| DuckDuckGo HTML | Direct result href in the active path |
-
-If unwrapping produces another provider wrapper, do not recursively fetch it. Either apply one bounded decode rule or reject the item.
-
-## Duplicate algorithm
-
-1. Validate and unwrap the destination.
-2. Produce canonical_identity.
-3. Look up the identity in a map.
-4. If absent, insert a new merged record.
-5. If present, merge fields and append a labelled provider observation.
-6. Keep the earliest provider position for each provider.
-7. Recalculate score after all provider outcomes have been accepted.
-
-The lookup map should store the complete identity string, not only a language-runtime hash. If a hash is used for indexing, compare the strings after a hash match to avoid collision-dependent merging.
-
-## Examples
-
-### Same destination, different scheme
-
-    https://example.test/docs
-    http://example.test/docs
-
-Under the recommended HTTP/HTTPS-equivalence policy: merge, display HTTPS, retain both observed URLs and both providers/positions.
-
-### Same host, different tracking parameter
-
-    https://example.test/docs?article=7
-    https://example.test/docs?article=7&utm_source=search
-
-V1 conservative policy: do not merge unless an allowlisted host/parameter policy explicitly removes the tracking parameter. Retain both results if not proven equivalent.
-
-### Same page, different fragment
-
-    https://example.test/docs#intro
-    https://example.test/docs#api
-
-V1 conservative policy: keep separate identities. Optional page-identity mode may merge them later.
-
-### www difference
+These remain distinct:
 
     https://www.example.test/docs
     https://example.test/docs
 
-Keep separate. DNS or application-level equivalence is not established by URL spelling.
+### Trailing slash
 
-### Query order
+These normally remain distinct:
 
-    https://example.test/search?a=1&b=2
-    https://example.test/search?b=2&a=1
+    https://example.test/docs
+    https://example.test/docs/
 
-Keep separate in V1. Add host-specific query sorting only with evidence that the parameters are order-independent.
+### Image source
 
-## Display URL selection
+Two otherwise equal results can remain distinct if their `img_src` values differ. A normal Google web thumbnail is stored in `thumbnail`, not necessarily `img_src`, so that thumbnail alone does not change ordinary identity.
 
-When merged records have different URLs:
+## Provider wrapper handling before identity
 
-1. Prefer a valid HTTPS URL over an HTTP URL when identity policy considers them equal.
-2. Prefer the URL with fewer provider wrapper artifacts.
-3. Prefer the first observed URL as a stable fallback.
-4. Never replace a URL with an unvalidated decoded value.
+Wrapper decoding occurs in provider parsing, before common normalization/hash:
 
-The selected display URL must remain absolute and must not contain credentials.
+- Google: only `/url?q=...` wrapper, split `&sa=U` before percent-decoding;
+- Bing: only exact `https://www.bing.com/ck/a?` wrapper, `u=a1...` URL-safe-base64 decode;
+- primary DuckDuckGo HTML: result href is used directly.
 
-## Future normalization layers
+The common identity layer does not independently re-run those provider decoders.
 
-Later versions may add:
+## Dictionary-key semantics
 
-- a host-specific tracking allowlist;
-- a configurable fragment policy;
-- canonical-host aliases explicitly maintained by product configuration;
-- provider-specific URL parameter normalization.
+The global main-result map is keyed directly by:
 
-Do not add a broad heuristic normalizer without fixture tests; false-positive merging is harder to detect than missed deduplication.
+    hash(result)
+
+an integer Python hash.
+
+When a key is absent, the result is inserted and its positions list is initialized. When a key already exists, the new result is merged into the existing result and the new position is appended.
+
+There is no second full identity-string equality comparison after an integer-hash match.
+
+This creates a theoretical Python-hash collision risk. Replacing the map key with the full structured identity would be a robustness improvement, but it is **not exact parity**.
+
+## No separate provider-local deduplication stage
+
+There is no independent pre-pass that first collapses duplicates within each provider. Results enter the shared container in provider output order. The same global identity map handles both:
+
+- duplicates from the same provider;
+- duplicates across different providers.
+
+If one provider emits the same identity multiple times, multiple positions can therefore be appended and influence the score. The source does not enforce “one vote per provider”.
+
+**PARITY MUST:** do not silently add provider-local duplicate collapse before ranking.
+
+## Position and provenance effects
+
+On first insertion:
+
+    positions = [provider_local_position]
+
+On every duplicate merge:
+
+    merge fields/provenance
+    positions.append(provider_local_position)
+
+The positions list is unlabelled in the compatibility model. Provider names are held separately in the `engines` set. Therefore the original structure cannot reconstruct which exact position came from which engine after merge.
+
+An embedded tool may maintain an auxiliary labelled observation list for explainability, but scoring must still consume the compatibility positions list if exact parity is required.
+
+## Secure-scheme preference during merge
+
+Although scheme is ignored for identity, merge can alter the displayed URL. If the current merged URL scheme does not end in `s` and the duplicate's scheme does end in `s`, the merged parsed URL adopts the duplicate's scheme.
+
+Thus HTTP/HTTPS identity equivalence and secure-scheme display preference are separate behaviors.
+
+## Exact parity algorithm
+
+Conceptually:
+
+    normalize(result)
+    key = python_hash(template, netloc, path, params, query, fragment, img_src)
+
+    if key not present:
+        result.positions = [position]
+        map[key] = result
+    else:
+        merge_existing_with(result)
+        map[key].positions.append(position)
+
+The implementation can use an equivalent structured key instead of Python's randomized runtime hash only if the product deliberately prefers collision safety over byte-for-byte internal behavior. If so, golden tests should prove that all non-collision ordinary cases match.
+
+## Golden tests
+
+Compatibility tests must cover:
+
+- identical URL from two providers merges;
+- HTTP and HTTPS merge;
+- differing `www` does not merge;
+- differing query order does not merge;
+- differing fragment does not merge;
+- differing trailing slash does not merge;
+- differing non-default port does not merge;
+- differing `img_src` does not merge;
+- differing thumbnail alone does not necessarily split identity;
+- same-provider duplicate is merged by the same global mechanism and appends another position;
+- wrapper decoding happens before identity;
+- scheme-preference chooses the `...s` variant during merge;
+- parity mode performs no tracking-parameter stripping or canonical-host aliasing.
+
+## Deliberate deviations
+
+Potential improvements include full-string keys to avoid hash collisions, HTTP(S)-only validation, tracking cleanup, provider-local duplicate collapse, and labelled positions. None should be hidden inside a supposed compatibility implementation. Add them only as named post-/pre-processing policies with separate tests.
