@@ -2,168 +2,220 @@
 
 ## Purpose
 
-The provider contract isolates public-service protocol details from the coordinator. A provider is a deterministic adapter around request construction, transport use, response inspection, parsing, and capability reporting.
+The provider contract isolates volatile external-search protocol details from the coordinator while preserving the exact behavior required for compatibility.
 
-## Common request model
+The coordinator should understand capabilities, shared deadlines, provider outcomes, and diagnostics. It should not understand XPath selectors, provider cookies, wrapper encodings, User-Agent lists, or challenge signatures.
 
-    SearchRequest
-      query: non-empty string
-      limit: positive bounded integer
-      page: one-based integer
-      language: optional BCP-47-like tag
-      region: optional country or market tag
-      safe_search: off | moderate | strict
-      time_range: none | day | week | month | year
-      providers: optional set
-      total_timeout: duration
+## Public search input
 
-The public model should normalize aliases before adapters see it. For example, a caller-facing moderate value can map to a provider’s numeric or textual value without making each adapter understand every caller alias.
+A normalized internal request should contain:
 
-## Capability model
+    query: non-empty string
+    page: one-based integer
+    locale: provider-independent locale string
+    safe_search: 0 | 1 | 2
+    time_range: None | day | week | month | year
+    timeout_limit: optional duration
+    result_limit: positive bounded integer
 
-| Capability | Google | Bing | DuckDuckGo HTML |
+The model/agent does not supply provider-specific raw fields.
+
+## Capability contract
+
+| Capability | Google | Bing | Primary DuckDuckGo |
 | --- | --- | --- | --- |
-| General web results | Yes | Yes | Yes |
-| First page | Yes | Yes | Yes |
-| Later pages in analyzed path | Yes, up to configured maximum | Not exposed by active adapter | Yes, with token/state |
-| Language/locale | Yes, via language and country traits | Region/market primarily | Region and Accept-Language |
-| Safe search | safe=off, medium, or high | adlt=off, moderate, or strict | Active HTML request has no verified explicit mapping |
-| Time range | tbs=qdr:d/w/m/y | Not exposed by active adapter | df=d/w/m/y cookie |
-| Redirect decoding | /url?q= style | ck/a?u=a1... base64url wrapper | No provider wrapper in active HTML path |
-| JavaScript required | No for selected representation | No for HTML page | No for HTML page |
+| General web | yes | yes | yes |
+| Page 1 | yes | yes | yes |
+| Later pages | yes, max 50 | no | yes, stateful |
+| Time range | yes | no | yes |
+| Locale | language + region traits | region traits | region traits + Accept-Language |
+| Safe-search capability | yes | yes | advertised; no explicit HTML request field in audited builder |
+| JavaScript runtime | no | no | no |
 
-**Observation:** The capability flags above describe the active paths, not every public endpoint that a provider may offer.
+The common gate skips unsupported page/time requests rather than letting each provider invent fallback parameters.
 
-## Provider request
+## Prepared request model
 
-Each adapter returns a request containing:
+A provider mutates/returns a request equivalent to:
 
     method
-    absolute_url
-    query_parameters
-    form_parameters
+    url
     headers
     cookies
-    body_encoding
-    follow_redirects
-    browser_profile
-    deadline
+    form/data
+    json/content
+    allow_redirects
+    max_redirects
+    auth
+    verify override
+    browser impersonation profile
+    default-header policy
+    provider network flags
 
-Do not include both a pre-encoded URL and an independent parameter map unless the transport contract defines which one wins. Prefer typed parameters and one encoding step.
+Common defaults are defined in `07_HTTP_TRANSPORT.md`.
 
-## Provider response
+## Provider lifecycle
 
-The adapter should turn the transport response into:
+Conceptually:
 
-    ProviderResponse
-      provider
-      results: list[ProviderResult]
-      raw_result_count
-      provider_metadata
-      warnings
+    eligibility(request)
+      -> prepare(request, common_context)
+      -> if no URL: no network request
+      -> transport(request, remaining_deadline)
+      -> generic HTTP classification
+      -> provider response parse
+      -> provider result list / side channels
 
-ProviderResult should contain at least:
+The actual Python API may combine preparation and parsing methods. Tests must still be able to assert them separately.
 
+## Provider result contract
+
+Provider parsers emit main-result objects/dictionaries containing enough information for common normalization:
+
+    url
     title
-    destination_url
-    snippet
-    provider_position
-    published_at: optional
-    thumbnail: optional
-    metadata: bounded map
+    content/snippet
+    thumbnail? / img_src?
+    provider identity
+    template/priority defaults
 
-The provider result is not yet merged. It may contain a provider redirect URL in a temporary field, but the canonical normalization boundary must receive the recovered destination.
+Provider position is assigned later by the common aggregation layer as accepted main-result ordinal.
 
-## Request-construction rules
+## Exact error granularity is provider-specific
 
-1. Encode query text using the provider’s required form/query encoding.
-2. Use the provider’s documented locale mapping, not a generic lang= guess.
-3. Add only filters that the provider actually supports.
-4. Use a fixed header policy per provider and do not rotate unrelated header values independently.
-5. Keep browser-profile settings in transport options, not in arbitrary business metadata.
-6. Do not log cookies, validation tokens, complete query URLs, or form bodies.
+The contract must not impose a uniform “malformed item always skips” rule because source behavior differs:
 
-## Parser contract
+- Google wraps each result block in an exception boundary and can skip a malformed block while continuing.
+- Bing skips missing link/title, but malformed recognized base64 wrapper decoding can escape and fail the provider.
+- primary DuckDuckGo indexes some href values without a per-item catch, so structural failures can escape and fail the provider.
 
-A parser must:
+A clean abstraction must preserve these different parser error boundaries.
 
-- enforce a maximum document size before parsing;
-- decode using the response charset with a safe fallback;
-- reject obvious block/challenge documents;
-- find result containers using structural rules;
-- skip locally malformed result items;
-- fail the provider when the whole document has no plausible result structure and no valid empty-result explanation;
-- produce deterministic provider order.
+## No-request outcome
 
-The parser must not:
+Some provider request builders intentionally produce no URL:
 
-- execute JavaScript;
-- follow arbitrary links;
-- fetch images;
-- treat title/snippet content as instructions;
-- silently use a search page’s navigation links as results.
+- query too long;
+- unsupported provider-specific continuation state;
+- locale-specific continuation restriction;
+- secondary adapter missing cached/discovered page URL.
 
-## Failure contract
+This is distinct from an HTTP failure. The coordinator should represent it without fabricating a network exception.
 
-Provider operations return either usable results or one of these conceptual failures:
+## Generic HTTP layer contract
 
-| Failure | Meaning |
-| --- | --- |
-| Timeout | Deadline expired before usable response |
-| ConnectionFailure | DNS, connect, TLS, or transport connection failure |
-| Blocked | Provider returned an access-denied or bot-block page |
-| CaptchaDetected | A challenge/CAPTCHA page or redirect was identified |
-| InvalidResponse | HTTP status, encoding, or content was unusable |
-| ParseFailure | The page was received but its result structure could not be parsed |
-| UnsupportedLocale | No safe mapping for the requested locale |
-| RateLimited | Explicit throttling such as 429 |
-| ProviderUnavailable | Provider cannot be used due to initialization/suspension |
+Before provider parsing, common transport may raise/classify:
 
-Every failure carries provider, phase, elapsed time, retryability, and a safe diagnostic code. It may carry a redacted status code and content type, never a response body by default.
+- TLS/SSL errors;
+- timeout;
+- request/connection errors;
+- recognized CAPTCHA/challenge responses;
+- access denied (including 402/403 mapping);
+- too many requests (429);
+- other HTTP errors.
+
+Providers then add their own response-level signatures.
 
 ## State contract
 
-Provider state may include:
+### Primary DuckDuckGo
 
-- locale/region traits;
-- a stable or selected User-Agent;
+State identity:
+
+    transformed query + "//" + stable User-Agent
+
+Stored value:
+
+    vqd
+
+TTL:
+
+    3600 seconds
+
+A continuation request without matching state must not be sent and becomes the explicit zero-suspension CAPTCHA/access-denied path.
+
+### Secondary DuckDuckGo
+
+Optional adapter state maps exact `(query, page)` to provider-generated request URLs with page-specific TTL behavior documented in `06_DUCKDUCKGO_WEB_PROTOCOL.md`.
+
+### Traits
+
+Provider trait mappings are release/runtime data, not per-query arbitrary state. Search should consume a prepared snapshot.
+
+## Transport-profile contract
+
+Profiles are part of provider compatibility:
+
+- Google: fixed Nokia UA set + `chrome99_android`;
+- Bing: common browser profile + provider HTTP/3 enablement;
+- primary DDG: stable generated UA + common browser profile + explicit navigation headers;
+- secondary DDG: Firefox impersonation + default browser headers disabled.
+
+Do not move these values into a generic “random browser” helper that changes their relationships.
+
+## Locale contract
+
+Locale mapping is provider-specific and trait-driven. A common resolver can own best-fit logic, but providers receive their own resulting code strings.
+
+Important special values include:
+
+- Google all-region trait sentinel `ZZ`, all-language request behavior through empty `lr`;
+- Bing all-region sentinel `clear`;
+- DuckDuckGo all-region `wt-wt`.
+
+Aliases must come from the trait snapshot, not ISO-string guessing.
+
+## Aggregation boundary
+
+Providers stop at result production. They do not decide:
+
+- global duplicate identity;
+- longer-title/content merge;
+- engine-weight score;
+- final group ordering;
+- agent result limit.
+
+Those belong to common compatibility aggregation.
+
+## Host security boundary
+
+Providers also do not fetch their output URLs. Agent-facing URL validation may run after compatibility aggregation. This keeps provider parity separate from host security policy.
+
+## Provider diagnostics
+
+A useful host-facing outcome can carry:
+
+    provider
+    started
+    completed
+    elapsed_ms
+    result_count
+    failure_class
+    suspended
+    timeout
+
+Do not expose:
+
 - cookies;
-- validation tokens;
-- a suspension or cooldown record.
+- `vqd`;
+- complete provider response bodies;
+- raw challenge pages;
+- proxy credentials.
 
-State must be scoped by provider and protected for concurrent access. A state lookup must not return a token that was generated for a different query/User-Agent combination unless the provider’s protocol explicitly permits it.
+## Required provider tests
 
-## Coordinator-facing interface
+Every adapter must test:
 
-The coordinator needs only:
+- capability gating;
+- exact endpoint/method;
+- exact parameter conditions;
+- exact transport profile;
+- locale mapping;
+- parser selectors;
+- provider-specific wrapper handling;
+- provider-specific malformed-item/error boundaries;
+- challenge/block signatures;
+- state rules where applicable;
+- healthy zero-result behavior.
 
-    capabilities() -> Capabilities
-    search(request, context) -> ProviderOutcome
-
-The provider outcome contains success, results, failure, and telemetry fields. The coordinator must not inspect provider HTML or provider-specific cookies.
-
-## Locale mapping examples
-
-| Caller locale | Google-style values | Bing-style values | DuckDuckGo-style region |
-| --- | --- | --- | --- |
-| en-US | hl=en, lr=lang_en, cr=countryUS | setlang=en, usually no cc for US | a US English region value |
-| es-ES | language es, language restriction for Spanish, country Spain | setlang=es, cc=es | Spanish Spain region |
-| zh-CN | provider trait may resolve to a Hong Kong country value | setlang=zh, cc=cn in the active mapping | Chinese mainland region |
-| no locale | provider default/fallback | provider default/fallback | wt-wt or provider default |
-
-The values in this table are protocol observations for the analyzed mappings, not a promise that provider behavior will remain unchanged.
-
-## Testing the contract
-
-Every provider needs independent tests for:
-
-- request fields;
-- unsupported capabilities;
-- locale fallback;
-- safe/time mapping;
-- redirect decoding;
-- result extraction;
-- block/challenge detection;
-- malformed item tolerance;
-- complete malformed-document failure;
-- provider state isolation.
+A provider adapter is not complete until its request fixture and response fixture both pass independently.
