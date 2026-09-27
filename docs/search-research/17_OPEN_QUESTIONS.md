@@ -2,134 +2,154 @@
 
 ## Purpose
 
-The implementation mechanics are now specified by compatibility behavior. The remaining unknowns are primarily external: public search endpoints, markup, challenge behavior, transport acceptance, and provider-maintained locale resources can change without our code changing.
+The simplified Overmind V0 is now fully specified for implementation. Remaining unknowns fall into two classes:
 
-These questions must not be used as an excuse to redesign documented behavior before the parity suite is implemented.
+- **operational/live uncertainties** — external providers may drift or block the documented protocol;
+- **later/full-compatibility decisions** — locale traits, paging, persistence, external bangs, or optional providers that V0 intentionally does not expose.
 
-## 1. Google endpoint health
+None of the items below is a specification blocker for simplified V0 unless explicitly marked otherwise.
 
-Validate from the intended deployment egress:
+## V0 blocker status
+
+Current status:
+
+    specification blockers: none
+
+The V0 coding agent can implement solely from this documentation set plus the target Overmind repository.
+
+What still requires live validation is whether external services currently accept the documented fingerprints from the intended deployment network.
+
+## 1. Google live endpoint health
+
+Validate from intended deployment egress:
 
 - `https://www.google.com/wml/search` remains reachable;
-- Nokia User-Agent + `chrome99_android` still returns expected result markup;
-- the current result classes remain present;
-- redirect-disabled 302 and `/sorry` signals still correspond to block/challenge behavior;
-- locale parameters continue to produce expected language/region behavior.
+- Nokia User-Agent + `chrome99_android` still returns expected markup;
+- current result classes remain present;
+- redirect-disabled 302 and `/sorry` signals still correspond to block/challenge behavior.
 
-If not, preserve old fixtures and investigate protocol drift before changing the adapter.
+For V0 use the fixed all-locale vector from `18`/`20`; broad locale behavior is later work.
 
-## 2. Bing HTML health
+If live behavior differs, preserve offline fixture/vector expectations until protocol drift is understood. Do not silently mutate parser/request logic from one failed live run.
+
+## 2. Bing live endpoint health
 
 Validate:
 
-- `/search` still returns `b_results/b_algo` structure;
-- `ck/a?u=a1...` remains the common wrapper format where used;
-- `setlang/cc` behavior remains effective;
-- the `us/cn/ru` cc exclusions remain desirable;
-- HTTP/3 is accepted/beneficial from intended egress;
-- healthy zero-result pages can still be distinguished operationally from block pages through status/telemetry.
+- `/search` returns the documented `b_results/b_algo` structure;
+- `ck/a?u=a1...` remains used where wrapper links appear;
+- V0 all-locale `q + adlt=off` remains accepted;
+- HTTP/3 is available/beneficial on target packaging if desired.
 
-Do not invent page/time support merely because Bing's website supports it interactively.
+HTTP/3 is not a V0 correctness blocker. If unavailable, record HTTP/2-only transport as a named transport deviation while preserving request/parser semantics.
 
 ## 3. Primary DuckDuckGo HTML health
 
 Validate:
 
-- `html.duckduckgo.com/html/` accepts the documented form/headers;
-- a stable generated User-Agent remains compatible with continuation `vqd`;
-- hidden `vqd` is still emitted when continuation is available;
-- 3600-second token reuse remains accepted;
-- `kl` form/cookie region behavior remains valid;
-- `df` form/cookie time behavior remains valid;
-- continuation offsets remain 10 then +15;
-- `challenge-form` remains the challenge marker;
-- Chinese continuation restriction is still necessary;
-- 303 remains a meaningful empty outcome.
+- `html.duckduckgo.com/html/` accepts the documented POST form/headers;
+- stable generated User-Agent remains accepted;
+- hidden `vqd` is still emitted where observed;
+- `challenge-form` remains a meaningful challenge marker;
+- 303 remains the documented healthy-empty outcome.
 
-If continuation becomes unreliable, first-page-only operation is a safe capability reduction; do not send tokenless continuation requests.
+V0 uses page one only, so continuation viability is not a V0 blocker.
 
-## 4. DuckDuckGo safe-search semantics
+## 4. Full-reference locale trait snapshot
 
-The primary HTML adapter advertises safe-search capability but does not add a safe-search request value from the numeric setting in the audited builder.
+Not required for V0 because locale is fixed to `all`.
 
-Live research can determine whether the endpoint currently has a stable explicit field/cookie, but adding one would be a new protocol feature, not parity with the audited path. Until deliberately implemented, do not claim strict DDG safe-search enforcement at request level.
+Later compatibility work should ship generated provider trait snapshots and tests. Decide:
 
-## 5. Secondary DuckDuckGo adapter viability
+- refresh cadence;
+- release/CI/manual generation workflow;
+- promised locale set;
+- drift detection.
 
-This optional adapter is real but disabled in the audited default configuration. Before implementing it for Overmind, validate:
+Per-query live trait scraping should remain unnecessary.
 
-- discovery page still exposes `deep_preload_link`;
-- opaque `dp`/API URL behavior still requires discovery;
-- JSON `results` still exposes `u/t/a` and continuation `n`;
-- the arithmetic challenge grammar remains within the documented narrow parser;
-- Firefox impersonation remains required/accepted.
+## 5. DuckDuckGo continuation state
 
-This is not a blocker for primary V1.
+Not required for V0.
 
-## 6. Trait freshness
+Later validate:
 
-The compatibility design should ship generated provider trait snapshots. Establish a maintenance process for validating/updating them.
+- hidden `vqd` extraction;
+- query + stable-UA binding;
+- 3600-second reuse;
+- continuation offsets;
+- Chinese continuation restriction;
+- persistence choice.
 
-Questions:
+A failure of continuation must never cause V0 to send tokenless page-two requests.
 
-- how often should snapshots be refreshed;
-- should refresh run manually in development/CI or as a release task;
-- which locales Overmind promises to support in tests;
-- how to detect provider alias changes without adding runtime latency.
+## 6. External bang support
 
-The per-query search path should not depend on live trait scraping.
+V0 rejects whitespace-delimited tokens beginning with `!` and does not ship the external-bang dataset.
 
-## 7. Cache persistence decision
+Later support requires a maintained bang recognition table if exact quoting behavior is desired. Do not approximate “recognized bang” with arbitrary prefix matching while claiming compatibility.
 
-Primary DDG source behavior uses persistent provider cache state. Overmind may prefer in-memory TTL state initially.
+## 7. DuckDuckGo safe-search semantics
 
-Decision needed:
+Not exposed in V0.
 
-- exact persistence across runtime restarts, or
-- process-local parity only.
+The primary HTML adapter advertises safe capability but the audited builder does not add a request value from the numeric safe setting. Any future explicit DDG safe field/cookie would be a new protocol feature unless directly supported by a later audited implementation.
 
-If in-memory is chosen, document it as an operational deviation; request/state semantics within one runtime remain exact.
+## 8. Secondary DuckDuckGo adapter
 
-## 8. Hash-key representation decision
+Not part of V0.
 
-The audited result map uses the Python integer `hash(result)` directly as the dictionary key. This admits theoretical hash-collision merging.
+Before later implementation validate:
 
-For an independent implementation, a structured tuple containing the exact identity fields can preserve all ordinary duplicate semantics while eliminating collision ambiguity.
+- discovery page `deep_preload_link`;
+- opaque `dp`/API URL discovery;
+- JSON `results` fields and continuation;
+- narrow arithmetic challenge grammar;
+- Firefox impersonation viability.
 
-Decision needed:
+## 9. Cache persistence
 
-- reproduce integer-hash storage literally, or
-- use a structured identity key and classify it as a safety/internal deviation.
+V0 uses process-local health/suspension state and may capture DDG `vqd` in memory only.
 
-Recommendation for implementation engineering: structured key is acceptable only if parity tests prove identical behavior for all non-collision cases and documentation clearly records the difference.
+Later decide whether provider state must survive runtime restart. Persistence changes operational continuity, not page-one V0 request semantics.
 
-## 9. Equal-score tie behavior
+## 10. Identity map representation
 
-Exact source ordering uses stable sort with insertion order and no explicit tie-break. Native async task completion can therefore affect equal-score ordering.
+The audited implementation uses Python integer `hash(result)` as the map key. A structured tuple of the exact identity fields avoids theoretical hash collision merging.
 
-Decide whether V1 must reproduce this exactly or whether Overmind wants a deterministic tie-break as a named later ranking mode.
+For V0, either choice is implementable. If a tuple is used, record this as the documented collision-safety deviation and prove all non-collision duplicate vectors remain identical.
 
-The compatibility mode should preserve insertion semantics until an explicit product decision changes it.
+This does not block coding.
 
-## 10. Host URL output policy
+## 11. Equal-score ties
 
-Provider parity can produce decoded/normalized URLs without strict HTTP(S)-absolute validation. Before returning results to the agent, Overmind should define whether it:
+Compatibility sorting is stable and has no explicit canonical tie-break. Worker completion/insertion order can therefore influence equal-score results.
 
-- exposes parity output unchanged;
-- filters non-HTTP(S) values only at serialization;
-- marks unsafe/unusual URLs as omitted/quarantined.
+V0 should preserve this behavior. A deterministic secondary tie-break would be a separate future ranking mode, not an invisible cleanup.
 
-Whatever policy is chosen must remain downstream of parity aggregation so it does not silently change score/dedup tests.
+## 12. Host URL output policy
 
-## 11. Body/resource limits
+Provider parity can yield URLs without an extra strict HTTP(S)-absolute validation stage.
 
-The audited source does not implement the custom response-body limits proposed in the earlier research draft. Overmind should choose practical limits for runtime safety based on measured provider pages.
+For V0, do not add a pre-ranking URL cleanup that changes identity/score. If Overmind later chooses output filtering/quarantine, apply it downstream and label it as host policy.
 
-Validate normal response-size distributions before setting caps. A host cap should fail a provider cleanly rather than truncate markup and emit plausible-but-wrong results.
+## 13. Response body/resource limits
 
-## 12. Live smoke-test cadence
+The audited search path does not provide the custom body limits proposed in early drafts. Overmind may later add host safety caps after measuring normal provider response sizes.
 
-Define a low-rate schedule outside mandatory unit CI. Each run should record only safe operational facts:
+A cap should fail a provider cleanly rather than truncate parser input and emit plausible partial results.
+
+This is not a V0 parity blocker.
+
+## 14. Dependency/platform live check
+
+Before merge, verify the chosen pinned `curl_cffi` and `lxml` versions against Overmind's supported CPython/platform matrix and regenerate the repository's normal dependency lock/manifest surfaces.
+
+This is an implementation/packaging acceptance step, not a search-protocol unknown.
+
+## 15. Live smoke-test cadence
+
+Use low-rate tests outside mandatory offline unit CI. Record only safe operational facts:
 
     provider
     status
@@ -142,18 +162,21 @@ Define a low-rate schedule outside mandatory unit CI. Each run should record onl
 
 Do not store raw queries, cookies, validation tokens, or full response bodies in routine telemetry.
 
-## Implementation readiness gate
+## V0 implementation readiness gate
 
-The primary V1 can begin now. None of the unresolved questions above prevents implementation because the documented parity behavior is sufficient for:
+The V0 implementation can begin now because documentation contains:
 
-- transport;
-- Google/Bing/DDG requests;
-- parsers;
-- primary DDG continuation state;
-- normalization;
-- duplicate merge;
-- ranking/grouping;
-- concurrency/deadlines;
-- failure isolation.
+- exact public Tool scope;
+- exact Overmind registration/authorization path;
+- exact page-one request vectors for Google/Bing/DDG;
+- exact parser selectors/error boundaries;
+- exact common normalization;
+- exact duplicate identity and merge;
+- exact score/grouping rules;
+- shared deadline and late-result suppression;
+- cancellation semantics;
+- failure isolation and suspension values;
+- deterministic synthetic vectors;
+- coding-agent dry-run/build order.
 
-Before declaring the tool production-ready, run live smoke validation from the actual deployment network and resolve any external protocol drift discovered there.
+The remaining risks are external service drift and normal implementation defects, not missing V0 specification.
